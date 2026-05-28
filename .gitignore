@@ -1,0 +1,42 @@
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.env
+.env.*
+
+# Test/build/tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+*.egg-info/
+
+# Training outputs and model artifacts
+checkpoints/*
+!checkpoints/.gitkeep
+*.pt
+*.pth
+*.ckpt
+*.onnx
+
+# Saved game records
+gamerecord/*
+!gamerecord/.gitkeep
+
+# Logs and local run output
+*.log
+train_log.txt
+outputs.txt
+outputs.yxy
+log_*.txt
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
