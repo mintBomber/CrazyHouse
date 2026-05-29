@@ -17,9 +17,11 @@ dist/
 *.egg-info/
 
 # Training outputs and model artifacts
+# Include only the pre-trained latest.pt so new users can play immediately.
 checkpoints/*
-!checkpoints/.gitkeep
-*.pt
+!checkpoints/run_quick_cpu/
+checkpoints/run_quick_cpu/*
+!checkpoints/run_quick_cpu/latest.pt
 *.pth
 *.ckpt
 *.onnx

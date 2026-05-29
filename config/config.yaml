@@ -40,8 +40,8 @@ training:
   self_play_record_dir: "selfplay_records" # Saved under selfplay_records/{run_name}
 
 ui:
-  window_width: 1200
-  window_height: 800
+  window_width: 800
+  window_height: 600
   # Board image is displayed at board_display_width wide, aspect-ratio preserved.
   # Original chess_board.png is 1602x1202 → scaled to 890x668 here.
   board_offset_x: 150    # Board image left edge in window

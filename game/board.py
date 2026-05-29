@@ -6,7 +6,7 @@ Variant rules vs standard chess:
      square as the player's own piece (shogi-style).
   2. A pawn may NOT be dropped on the opponent's back rank (rank 8 for White,
      rank 1 for Black).
-  3. A drop that immediately checkmates the opponent is illegal.
+  3. A pawn drop that immediately checkmates the opponent is illegal (Uchi-fu-zume).
   4. Kings are never captured; game ends by checkmate.
 
 Board coordinate convention:
@@ -51,7 +51,7 @@ class GameState:
     __slots__ = (
         "board", "hands", "castling_rights", "en_passant",
         "current_player", "halfmove_clock", "fullmove_number",
-        "position_history",
+        "position_history", "drop_mode",
     )
 
     def __init__(self) -> None:
@@ -71,6 +71,10 @@ class GameState:
         self.current_player: Color = Color.WHITE
         self.halfmove_clock: int = 0
         self.fullmove_number: int = 1
+
+        # True = Crazy House (captures go to hand, drops allowed)
+        # False = Standard Chess (no drops)
+        self.drop_mode: bool = True
 
         # List of position keys for repetition detection
         self.position_history: List[str] = [self._position_key()]
@@ -92,6 +96,7 @@ class GameState:
         s.halfmove_clock = self.halfmove_clock
         s.fullmove_number = self.fullmove_number
         s.position_history = list(self.position_history)
+        s.drop_mode = self.drop_mode
         return s
 
     def _position_key(self) -> str:
@@ -128,9 +133,10 @@ class GameState:
                 return True
 
         # Pawn attacks
-        # White king is attacked from below-left/below-right by black pawns.
-        # pawn_dir: direction from king toward attacking pawn.
-        pawn_dir = 1 if color == Color.WHITE else -1
+        # Black pawn at (r,c) attacks (r+1, c±1); white pawn attacks (r-1, c±1).
+        # To find the attacker: look at row kr-1 for the white king (black pawns above it),
+        # and row kr+1 for the black king (white pawns below it).
+        pawn_dir = -1 if color == Color.WHITE else 1
         pv = int(PieceType.PAWN) * opp_sign
         for dc in (-1, 1):
             r, c = kr+pawn_dir, kc+dc
@@ -304,8 +310,10 @@ class GameState:
                     moves.extend(self._king_moves(r, c, player))
         return moves
 
-    def _pseudo_drop_moves(self, apply_drop_mate_filter: bool = True) -> List[Move]:
+    def _pseudo_drop_moves(self, apply_pawn_mate_filter: bool = True) -> List[Move]:
         """Generate all pseudo-legal drop moves for the current player."""
+        if not self.drop_mode:
+            return []
         player     = self.current_player
         hand       = self.hands[player]
         back_rank  = 0 if player == Color.WHITE else 7   # opponent's back rank
@@ -323,22 +331,24 @@ class GameState:
                         continue
                     drop_moves.append(Move(None,(r,c), is_drop=True, drop_piece=pt))
 
-        if not apply_drop_mate_filter:
+        if not apply_pawn_mate_filter:
             return drop_moves
 
-        # Filter: any drop that immediately checkmates the opponent is illegal.
+        # Filter: only pawn drops that immediately checkmate are illegal (Uchi-fu-zume).
+        # Drops of other pieces that cause immediate checkmate are fully legal.
         opp   = player.opponent()
         legal: List[Move] = []
         for mv in drop_moves:
+            if mv.drop_piece != PieceType.PAWN:
+                legal.append(mv)
+                continue
             test = self.copy()
             test._apply_unchecked(mv)
-            # Check if opponent is in checkmate (no legal reply).
             if test.is_in_check(opp):
                 test.current_player = opp
-                # Use base (no drop-mate filter) to avoid infinite recursion.
                 replies = test._get_legal_moves_base()
                 if not replies:
-                    continue
+                    continue   # Illegal: pawn drop causes immediate checkmate
             legal.append(mv)
         return legal
 
@@ -353,17 +363,20 @@ class GameState:
         """
         player    = self.current_player
         pseudo    = self._pseudo_board_moves() + self._pseudo_drop_moves(
-            apply_drop_mate_filter=False)
+            apply_pawn_mate_filter=False)
         legal: List[Move] = []
 
         for mv in pseudo:
             test = self.copy()
             test._apply_unchecked(mv)
             if not test.is_in_check(player):
-                # Extra castling check: king can't pass through attacked square
+                # Castling path check: king must not pass through an attacked square.
+                # Only applies when the KING moves exactly 2 squares horizontally.
                 if (not mv.is_drop
                         and mv.from_pos is not None
-                        and abs(mv.from_pos[1] - mv.to_pos[1]) == 2):
+                        and mv.from_pos[0] == mv.to_pos[0]
+                        and abs(mv.from_pos[1] - mv.to_pos[1]) == 2
+                        and abs(int(self.board[mv.from_pos])) == int(PieceType.KING)):
                     if not self._castling_path_safe(mv, player):
                         continue
                 legal.append(mv)
@@ -373,7 +386,7 @@ class GameState:
         """All legal moves for the current player including variant drop rules."""
         player    = self.current_player
         pseudo    = self._pseudo_board_moves() + self._pseudo_drop_moves(
-            apply_drop_mate_filter=True)
+            apply_pawn_mate_filter=True)
         legal: List[Move] = []
 
         for mv in pseudo:
@@ -382,7 +395,9 @@ class GameState:
             if not test.is_in_check(player):
                 if (not mv.is_drop
                         and mv.from_pos is not None
-                        and abs(mv.from_pos[1] - mv.to_pos[1]) == 2):
+                        and mv.from_pos[0] == mv.to_pos[0]
+                        and abs(mv.from_pos[1] - mv.to_pos[1]) == 2
+                        and abs(int(self.board[mv.from_pos])) == int(PieceType.KING)):
                     if not self._castling_path_safe(mv, player):
                         continue
                 legal.append(mv)
@@ -438,14 +453,16 @@ class GameState:
                 cap_r = tr + (1 if player == Color.WHITE else -1)
                 captured_val = int(self.board[cap_r, tc])
                 self.board[cap_r, tc] = 0
-                self.hands[player][PieceType(abs(captured_val))] += 1
+                if self.drop_mode:
+                    self.hands[player][PieceType(abs(captured_val))] += 1
                 is_pawn_or_capture = True
 
             # Regular capture
             target = int(self.board[tr, tc])
             if target != 0:
                 cap_pt = PieceType(abs(target))
-                self.hands[player][cap_pt] += 1
+                if self.drop_mode:
+                    self.hands[player][cap_pt] += 1
                 is_pawn_or_capture = True
                 # Losing castling rights when the rook square is captured
                 if (tr, tc) == (7, 0): self.castling_rights[1] = False
