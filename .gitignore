@@ -45,7 +45,17 @@ Thumbs.db
 .vscode/
 .idea/
 
-＃others
+# others
 refine_plan.md
 training_parameters_guide.md
 training_config_presets.md
+dev_handover.md
+
+# AI vs AI results (auto-generated)
+aivai_results/*
+!aivai_results/.gitkeep
+
+# PyInstaller build output
+dist/
+build/
+*.spec
