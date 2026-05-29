@@ -22,6 +22,7 @@ import random
 import time
 import glob
 import argparse
+import json
 from collections import deque
 from typing import List, Tuple
 
@@ -52,15 +53,16 @@ def self_play_game(
     network: AlphaZeroNet,
     cfg: dict,
     device: str,
-) -> List[Sample]:
+) -> Tuple[List[Sample], dict]:
     """
     Play one game against itself using Gumbel MCTS.
-    Returns a list of (state_tensor_CHW, improved_policy, outcome) tuples.
+    Returns training samples and a JSON-serializable game record.
     Outcome is from the perspective of the player who was to move at that state.
     """
     planner   = GumbelMCTS(network, cfg["ai"])
     state     = GameState()
     samples: List[Tuple[np.ndarray, np.ndarray, Color]] = []
+    moves: List[dict] = []
     max_moves = cfg["game"]["max_moves"]
     thresh    = cfg["ai"].get("temperature_threshold", 30)
 
@@ -85,7 +87,15 @@ def self_play_game(
             lp /= lp.sum()
 
         chosen = int(np.random.choice(len(legal), p=lp))
-        state.apply_move(legal[chosen])
+        move = legal[chosen]
+        moves.append(_record_self_play_move(
+            move=move,
+            player=state.current_player,
+            move_number=move_num + 1,
+            policy_prob=float(lp[chosen]),
+        ))
+        state.apply_move(move)
+        moves[-1]["check"] = state.is_in_check(state.current_player)
 
     # Determine outcome
     winner = state.get_winner()   # Color or None
@@ -101,7 +111,41 @@ def self_play_game(
             z = -1.0
         result.append((obs, policy, z))
 
-    return result
+    if winner == Color.WHITE:
+        result_label = "white_win"
+    elif winner == Color.BLACK:
+        result_label = "black_win"
+    else:
+        result_label = "draw"
+
+    record = {
+        "move_count": len(moves),
+        "result": result_label,
+        "winner": (
+            "white" if winner == Color.WHITE
+            else "black" if winner == Color.BLACK
+            else None
+        ),
+        "moves": moves,
+        "final_board": repr(state),
+    }
+
+    return result, record
+
+
+def _record_self_play_move(move, player: Color, move_number: int, policy_prob: float) -> dict:
+    return {
+        "move_number": move_number,
+        "player": "white" if player == Color.WHITE else "black",
+        "notation": str(move),
+        "from": list(move.from_pos) if move.from_pos is not None else None,
+        "to": list(move.to_pos),
+        "promotion": move.promotion.name if move.promotion else None,
+        "is_drop": move.is_drop,
+        "drop_piece": move.drop_piece.name if move.drop_piece else None,
+        "policy_prob": policy_prob,
+        "check": False,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -167,6 +211,41 @@ def ckpt_path(cfg: dict, iteration: int) -> str:
 
 def latest_path(cfg: dict) -> str:
     return os.path.join(ckpt_dir(cfg), "latest.pt")
+
+
+def selfplay_record_dir(cfg: dict) -> str:
+    train_cfg = cfg["training"]
+    run_name = train_cfg.get("run_name")
+    root = _resolve_project_path(train_cfg.get("self_play_record_dir", "selfplay_records"))
+    return os.path.join(root, run_name)
+
+
+def save_self_play_record(
+    cfg: dict,
+    iteration: int,
+    game_index: int,
+    completed_step: int,
+    record: dict,
+) -> str:
+    out_dir = selfplay_record_dir(cfg)
+    os.makedirs(out_dir, exist_ok=True)
+
+    data = {
+        "game": "Chess x Shogi",
+        "source": "training_self_play",
+        "run_name": cfg["training"]["run_name"],
+        "iteration": iteration,
+        "game_index": game_index,
+        "step": completed_step,
+        "saved_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        **record,
+    }
+
+    filename = f"iter_{iteration:05d}_game_{game_index:05d}_step_{completed_step:06d}.json"
+    path = os.path.join(out_dir, filename)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    return path
 
 
 def _torch_load_checkpoint(path: str, device: str):
@@ -250,6 +329,7 @@ def main(argv: List[str] | None = None):
     total_iterations = int(train_cfg.get("total_iterations", 0))
     save_every = int(train_cfg.get("save_every_n_iters", 0))
     num_self_play_games = int(train_cfg["num_self_play_games"])
+    save_self_play_records = bool(train_cfg.get("save_self_play_records", True))
 
     if total_iterations < 1:
         raise ValueError("training.total_iterations must be >= 1")
@@ -264,6 +344,8 @@ def main(argv: List[str] | None = None):
     print(f"[train] run={train_cfg['run_name']} total_iterations={total_iterations}")
     print(f"[train] self-play steps={completed_steps} / {total_steps} steps")
     print(f"[train] checkpoint_dir={ckpt_dir(cfg)}")
+    if save_self_play_records:
+        print(f"[train] self_play_record_dir={selfplay_record_dir(cfg)}")
 
     buffer: deque = deque(maxlen=train_cfg["buffer_size"])
 
@@ -277,9 +359,17 @@ def main(argv: List[str] | None = None):
         # Self-play phase
         network.eval()
         for game_idx in range(num_self_play_games):
-            samples = self_play_game(network, cfg, device)
+            samples, game_record = self_play_game(network, cfg, device)
             buffer.extend(samples)
             completed_steps += 1
+            if save_self_play_records:
+                save_self_play_record(
+                    cfg,
+                    iteration=iteration,
+                    game_index=game_idx + 1,
+                    completed_step=completed_steps,
+                    record=game_record,
+                )
             if completed_steps % 10 == 0 or completed_steps == total_steps:
                 print(f"{completed_steps} / {total_steps} steps")
 

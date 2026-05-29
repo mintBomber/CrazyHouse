@@ -28,7 +28,7 @@ import sys
 import threading
 import time
 from datetime import datetime
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 import pygame
 
@@ -132,18 +132,21 @@ class ChessUI:
 
         # Fonts
         fs = ui.get("font_size", 22)
-        self.font_md = pygame.font.SysFont("segoeui", fs)
-        self.font_sm = pygame.font.SysFont("segoeui", int(fs * 0.8))
+        self.font_md = pygame.font.SysFont("segoeui", fs, bold=True)
+        self.font_sm = pygame.font.SysFont("segoeui", int(fs * 0.8), bold=True)
+        self.font_xs = pygame.font.SysFont("segoeui", int(fs * 0.65), bold=True)
         self.font_lg = pygame.font.SysFont("segoeui", int(fs * 1.6), bold=True)
 
         # Load assets
         self.sprites   = load_sprites(
             os.path.join(asset_dir, "chess_pieces.png"), self.SQ)
+        self.sprites = self._apply_piece_outlines(self.sprites)
         self.board_img = load_board_image(
             os.path.join(asset_dir, "chess_board.png"), self.BW)
         # Smaller sprites for the hand panel
         self.sprites_sm = load_sprites(
             os.path.join(asset_dir, "chess_pieces.png"), self.HAND_SQ)
+        self.sprites_sm = self._apply_piece_outlines(self.sprites_sm, radius=1)
 
         # Game state
         self.state: Optional[GameState] = None
@@ -154,7 +157,38 @@ class ChessUI:
         self.game_record: List[dict] = []
         self._game_started_at: Optional[str] = None
         self._last_saved_record: Optional[str] = None
+        self._resign_btn_rect = pygame.Rect(8, self.H - 190, max(80, self.BX - 20), 34)
         self._save_btn_rect = pygame.Rect(8, self.H - 150, max(80, self.BX - 20), 34)
+        self._front_winrate: Optional[float] = None
+        self._value_eval_dirty = True
+        self._time_winner: Optional[Color] = None
+        self._resign_winner: Optional[Color] = None
+        self._clock_remaining = {
+            Color.WHITE: 5 * 60.0,
+            Color.BLACK: 5 * 60.0,
+        }
+        self._turn_started_at = time.monotonic()
+
+        # Pre-game settings
+        self._setup_first_color = Color.WHITE
+        self._setup_human_side = "first"
+        self._setup_main_minutes = 5
+        self._setup_byoyomi_seconds = 10
+        self._setup_active_field: Optional[str] = None
+        self._setup_input_text = ""
+        self.first_color = Color.WHITE
+        self.human_color = Color.WHITE
+        self.player1_color = Color.WHITE
+        self.main_time_sec = 5 * 60.0
+        self.byoyomi_sec = 10.0
+
+        # Replay state
+        self._is_replay = False
+        self._replay_moves: List[dict] = []
+        self._replay_index = 0
+        self._replay_auto = False
+        self._replay_last_step = 0.0
+        self._replay_source_name = ""
 
         # UI interaction state
         self.selected_square: Optional[Tuple[int,int]] = None  # (row, col)
@@ -183,6 +217,40 @@ class ChessUI:
     def run(self) -> None:
         self._show_menu()
 
+    def _apply_piece_outlines(
+        self,
+        sprites: dict[tuple[Color, PieceType], pygame.Surface],
+        radius: int = 2,
+    ) -> dict[tuple[Color, PieceType], pygame.Surface]:
+        outlined = {}
+        for (color, pt), surf in sprites.items():
+            outline_color = (0, 0, 0) if color == Color.WHITE else (255, 255, 255)
+            outlined[(color, pt)] = self._outline_surface(surf, outline_color, radius)
+        return outlined
+
+    def _outline_surface(
+        self,
+        surf: pygame.Surface,
+        color: tuple[int, int, int],
+        radius: int,
+    ) -> pygame.Surface:
+        base = surf.convert_alpha()
+        mask = pygame.mask.from_surface(base)
+        outline = mask.to_surface(
+            setcolor=(*color, 255),
+            unsetcolor=(0, 0, 0, 0),
+        ).convert_alpha()
+        result = pygame.Surface(base.get_size(), pygame.SRCALPHA)
+
+        for dx in range(-radius, radius + 1):
+            for dy in range(-radius, radius + 1):
+                if dx == 0 and dy == 0:
+                    continue
+                if dx * dx + dy * dy <= radius * radius + 1:
+                    result.blit(outline, (dx, dy))
+        result.blit(base, (0, 0))
+        return result
+
     # -----------------------------------------------------------------
     # Menu screen
     # -----------------------------------------------------------------
@@ -192,11 +260,13 @@ class ChessUI:
             ("Player  vs  Player",  "pvp"),
             ("Player  vs  AI",      "pvai"),
             ("AI  vs  AI",          "aivai"),
+            ("Replay GameRecord",    "replay"),
         ]
         bw, bh = 340, 60
         spacing = 24
         total_h = len(buttons) * (bh + spacing) - spacing
         start_y = (self.H - total_h) // 2 + 60
+        quit_rect = pygame.Rect((self.W - 220) // 2, self.H - 64, 220, 46)
 
         running = True
         while running:
@@ -221,24 +291,275 @@ class ChessUI:
                 txt = self.font_md.render(label, True, _C["btn_txt"])
                 self.screen.blit(txt, txt.get_rect(center=rect.center))
 
+            self._draw_rect_button(quit_rect, "Quit", mx, my)
+
             pygame.display.flip()
 
             for ev in pygame.event.get():
                 if ev.type == pygame.QUIT:
                     pygame.quit(); sys.exit()
                 if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
+                    if quit_rect.collidepoint(ev.pos):
+                        pygame.quit(); sys.exit()
                     for rect, mode in btn_rects:
                         if rect.collidepoint(ev.pos):
-                            self._start_game(mode)
+                            if mode == "replay":
+                                self._show_record_list()
+                            else:
+                                self._show_game_setup(mode)
                             return
 
     # -----------------------------------------------------------------
     # Game startup
     # -----------------------------------------------------------------
 
+    def _show_game_setup(self, mode: str) -> None:
+        bw, bh = 260, 46
+        center_x = self.W // 2
+
+        while True:
+            self.screen.fill(_C["bg"])
+            title = self.font_lg.render("Game Setup", True, _C["text"])
+            self.screen.blit(title, title.get_rect(center=(center_x, 90)))
+
+            mode_labels = {"pvp": "Player vs Player", "pvai": "Player vs AI",
+                           "aivai": "AI vs AI"}
+            mode_s = self.font_md.render(mode_labels.get(mode, ""), True, _C["text2"])
+            self.screen.blit(mode_s, mode_s.get_rect(center=(center_x, 138)))
+
+            mx, my = pygame.mouse.get_pos()
+            buttons: List[tuple[pygame.Rect, str]] = []
+
+            y = 190
+            self._draw_setup_label("First move", y)
+            buttons.extend(self._draw_choice_pair(
+                y, "White", "first_white", "Black", "first_black",
+                self._setup_first_color == Color.WHITE,
+            ))
+
+            y += 74
+            if mode == "pvai":
+                self._draw_setup_label("Human side", y)
+                buttons.extend(self._draw_choice_pair(
+                    y, "First", "human_first", "Second", "human_second",
+                    self._setup_human_side == "first",
+                ))
+            elif mode == "pvp":
+                self._draw_setup_label("Player 1", y)
+                buttons.extend(self._draw_choice_pair(
+                    y, "First", "human_first", "Second", "human_second",
+                    self._setup_human_side == "first",
+                ))
+
+            y += 82
+            self._draw_setup_stepper(
+                "Main time (min)",
+                y, "main_minus", "main_plus", buttons,
+                input_action="main_input",
+                value_text=str(self._setup_main_minutes),
+                active=self._setup_active_field == "main",
+                range_text="(0-60)",
+            )
+
+            y += 74
+            self._draw_setup_stepper(
+                "One-move time (sec)",
+                y, "byo_minus", "byo_plus", buttons,
+                input_action="byo_input",
+                value_text=str(self._setup_byoyomi_seconds),
+                active=self._setup_active_field == "byoyomi",
+                range_text="(0-600)",
+            )
+
+            start_rect = pygame.Rect(center_x - bw - 12, y + 90, bw, bh + 6)
+            back_rect = pygame.Rect(center_x + 12, y + 90, bw, bh + 6)
+            buttons.extend([(start_rect, "start"), (back_rect, "back")])
+            self._draw_rect_button(start_rect, "Start", mx, my)
+            self._draw_rect_button(back_rect, "Back", mx, my)
+
+            pygame.display.flip()
+
+            for ev in pygame.event.get():
+                if ev.type == pygame.QUIT:
+                    pygame.quit(); sys.exit()
+                if ev.type == pygame.KEYDOWN:
+                    if self._handle_setup_key(ev):
+                        continue
+                    if ev.key == pygame.K_ESCAPE:
+                        self._show_menu()
+                        return
+                if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
+                    clicked_any = False
+                    for rect, action in buttons:
+                        if not rect.collidepoint(ev.pos):
+                            continue
+                        clicked_any = True
+                        if action == "first_white":
+                            self._deactivate_setup_input()
+                            self._setup_first_color = Color.WHITE
+                        elif action == "first_black":
+                            self._deactivate_setup_input()
+                            self._setup_first_color = Color.BLACK
+                        elif action == "human_first":
+                            self._deactivate_setup_input()
+                            self._setup_human_side = "first"
+                        elif action == "human_second":
+                            self._deactivate_setup_input()
+                            self._setup_human_side = "second"
+                        elif action == "main_minus":
+                            self._deactivate_setup_input()
+                            self._setup_main_minutes = max(0, self._setup_main_minutes - 1)
+                        elif action == "main_plus":
+                            self._deactivate_setup_input()
+                            self._setup_main_minutes = min(60, self._setup_main_minutes + 1)
+                        elif action == "main_input":
+                            self._activate_setup_input("main", self._setup_main_minutes)
+                        elif action == "byo_minus":
+                            self._deactivate_setup_input()
+                            self._setup_byoyomi_seconds = max(0, self._setup_byoyomi_seconds - 1)
+                        elif action == "byo_plus":
+                            self._deactivate_setup_input()
+                            self._setup_byoyomi_seconds = min(600, self._setup_byoyomi_seconds + 1)
+                        elif action == "byo_input":
+                            self._activate_setup_input("byoyomi", self._setup_byoyomi_seconds)
+                        elif action == "start":
+                            self._deactivate_setup_input()
+                            self._start_game(mode)
+                            return
+                        elif action == "back":
+                            self._deactivate_setup_input()
+                            self._show_menu()
+                            return
+                        break
+                    if not clicked_any:
+                        self._deactivate_setup_input()
+
+    def _draw_setup_label(self, label: str, y: int) -> None:
+        s = self.font_md.render(label, True, _C["text"])
+        self.screen.blit(s, (self.W // 2 - 270, y + 9))
+
+    def _draw_choice_pair(
+        self,
+        y: int,
+        left_label: str,
+        left_action: str,
+        right_label: str,
+        right_action: str,
+        left_selected: bool,
+    ) -> List[tuple[pygame.Rect, str]]:
+        mx, my = pygame.mouse.get_pos()
+        left = pygame.Rect(self.W // 2 - 50, y, 150, 46)
+        right = pygame.Rect(self.W // 2 + 112, y, 150, 46)
+        self._draw_rect_button(left, left_label, mx, my, selected=left_selected)
+        self._draw_rect_button(right, right_label, mx, my, selected=not left_selected)
+        return [(left, left_action), (right, right_action)]
+
+    def _activate_setup_input(self, field: str, value: int) -> None:
+        self._setup_active_field = field
+        self._setup_input_text = str(value)
+
+    def _deactivate_setup_input(self) -> None:
+        if self._setup_active_field is not None:
+            self._commit_setup_input()
+        self._setup_active_field = None
+        self._setup_input_text = ""
+
+    def _commit_setup_input(self) -> None:
+        if self._setup_active_field is None:
+            return
+        value = int(self._setup_input_text) if self._setup_input_text else 0
+        if self._setup_active_field == "main":
+            self._setup_main_minutes = max(0, min(60, value))
+        elif self._setup_active_field == "byoyomi":
+            self._setup_byoyomi_seconds = max(0, min(600, value))
+
+    def _handle_setup_key(self, ev: pygame.event.Event) -> bool:
+        if self._setup_active_field is None:
+            return False
+
+        if ev.key in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_TAB):
+            self._deactivate_setup_input()
+            return True
+        if ev.key == pygame.K_ESCAPE:
+            self._deactivate_setup_input()
+            return True
+        if ev.key == pygame.K_BACKSPACE:
+            self._setup_input_text = self._setup_input_text[:-1]
+            return True
+        if ev.unicode and ev.unicode.isdigit():
+            max_len = 2 if self._setup_active_field == "main" else 3
+            if len(self._setup_input_text) < max_len:
+                self._setup_input_text += ev.unicode
+            return True
+        return True
+
+    def _draw_setup_stepper(
+        self,
+        label: str,
+        y: int,
+        minus_action: str,
+        plus_action: str,
+        buttons: List[tuple[pygame.Rect, str]],
+        input_action: Optional[str] = None,
+        value_text: Optional[str] = None,
+        active: bool = False,
+        range_text: Optional[str] = None,
+    ) -> None:
+        mx, my = pygame.mouse.get_pos()
+        label_s = self.font_md.render(label, True, _C["text"])
+        label_x = self.W // 2 - 270
+        self.screen.blit(label_s, (label_x, y + 2 if range_text else y + 8))
+        if range_text:
+            range_s = self.font_xs.render(range_text, True, _C["text2"])
+            self.screen.blit(range_s, (label_x, y + 29))
+        if input_action is not None:
+            input_rect = pygame.Rect(self.W // 2 + 22, y, 86, 46)
+            pygame.draw.rect(
+                self.screen,
+                (245, 245, 245) if active else (95, 95, 100),
+                input_rect,
+                border_radius=8,
+            )
+            pygame.draw.rect(
+                self.screen,
+                _C["hl_hand"] if active else _C["btn"],
+                input_rect,
+                width=2,
+                border_radius=8,
+            )
+            display = self._setup_input_text if active else (value_text or "")
+            value_s = self.font_md.render(display, True, (30, 30, 30) if active else _C["text"])
+            self.screen.blit(value_s, value_s.get_rect(center=input_rect.center))
+            buttons.append((input_rect, input_action))
+            minus = pygame.Rect(self.W // 2 + 122, y, 48, 46)
+            plus = pygame.Rect(self.W // 2 + 180, y, 48, 46)
+        else:
+            minus = pygame.Rect(self.W // 2 + 70, y, 54, 46)
+            plus = pygame.Rect(self.W // 2 + 138, y, 54, 46)
+        self._draw_rect_button(minus, "-", mx, my)
+        self._draw_rect_button(plus, "+", mx, my)
+        buttons.extend([(minus, minus_action), (plus, plus_action)])
+
+    def _draw_rect_button(
+        self,
+        rect: pygame.Rect,
+        label: str,
+        mx: int,
+        my: int,
+        selected: bool = False,
+        font: Optional[pygame.font.Font] = None,
+        text_color: Optional[tuple[int, int, int]] = None,
+    ) -> None:
+        color = _C["hl_hand"] if selected else (_C["btn_hover"] if rect.collidepoint(mx, my) else _C["btn"])
+        pygame.draw.rect(self.screen, color, rect, border_radius=8)
+        text = (font or self.font_md).render(label, True, text_color or _C["btn_txt"])
+        self.screen.blit(text, text.get_rect(center=rect.center))
+
     def _start_game(self, mode: str) -> None:
         self.game_mode   = mode
         self.state       = GameState()
+        self.state.current_player = self._setup_first_color
+        self.state.position_history = [self.state._position_key()]
         self.last_move   = None
         self.move_number = 0
         self.selected_square = None
@@ -251,13 +572,32 @@ class ChessUI:
         self.game_record = []
         self._game_started_at = datetime.now().isoformat(timespec="seconds")
         self._last_saved_record = None
+        self._front_winrate = None
+        self._value_eval_dirty = True
+        self._time_winner = None
+        self._resign_winner = None
+        self._is_replay = False
+        self.first_color = self._setup_first_color
+        self.main_time_sec = float(self._setup_main_minutes * 60)
+        self.byoyomi_sec = float(self._setup_byoyomi_seconds)
+        self._clock_remaining = {
+            Color.WHITE: self.main_time_sec,
+            Color.BLACK: self.main_time_sec,
+        }
+        self._turn_started_at = time.monotonic()
+
+        first = self._setup_first_color
+        second = first.opponent()
+        self.human_color = first if self._setup_human_side == "first" else second
+        self.player1_color = self.human_color
 
         if mode == "pvp":
             self.ai_white = None
             self.ai_black = None
         elif mode == "pvai":
-            self.ai_white = None                           # human plays White
-            self.ai_black = self._get_shared_agent()
+            agent = self._get_shared_agent()
+            self.ai_white = None if self.human_color == Color.WHITE else agent
+            self.ai_black = None if self.human_color == Color.BLACK else agent
         elif mode == "aivai":
             agent = self._get_shared_agent()
             self.ai_white = agent
@@ -269,6 +609,7 @@ class ChessUI:
         if self._shared_agent is None:
             from ai.agent import AIAgent
             self._shared_agent = AIAgent(self.cfg, self.default_ckpt)
+            self._value_eval_dirty = True
         return self._shared_agent
 
     # -----------------------------------------------------------------
@@ -278,13 +619,16 @@ class ChessUI:
     def _game_loop(self) -> None:
         while True:
             self.clock.tick(self.FPS)
+            self._check_time_forfeit()
             self._handle_events()
             self._check_ai_result()
             self._maybe_start_ai()
             self._draw_frame()
             pygame.display.flip()
 
-            if self.state.is_terminal():
+            if (self._time_winner is not None
+                    or self._resign_winner is not None
+                    or self.state.is_terminal()):
                 self._show_game_over()
                 return
 
@@ -304,8 +648,11 @@ class ChessUI:
 
             if ev.type == pygame.MOUSEBUTTONDOWN:
                 if ev.button == 1:
+                    if self._resign_btn_rect.collidepoint(ev.pos):
+                        self._show_resign_dialog()
+                        continue
                     if self._save_btn_rect.collidepoint(ev.pos):
-                        self._save_game_record()
+                        self._show_save_record_dialog()
                         continue
                     self._on_click(ev.pos)
                 elif ev.button == 3:
@@ -331,13 +678,20 @@ class ChessUI:
         hand_result = self._hand_click(pos)
         if hand_result is not None:
             color, pt = hand_result
-            if color == self.state.current_player:
-                if (self.selected_hand == (color, pt)):
-                    self._deselect()
-                else:
-                    self.selected_hand   = (color, pt)
-                    self.selected_square = None
-                    self._update_highlights()
+            if color != self.state.current_player:
+                self.status_msg = "Use current player's hand."
+                self._deselect()
+                return
+            if self.state.hands[color].get(pt, 0) <= 0:
+                self.status_msg = "No piece in hand."
+                self._deselect()
+                return
+            if (self.selected_hand == (color, pt)):
+                self._deselect()
+            else:
+                self.selected_hand   = (color, pt)
+                self.selected_square = None
+                self._update_highlights()
             return
 
         # Check board click
@@ -406,10 +760,16 @@ class ChessUI:
 
     def _execute_move(self, move: Move) -> None:
         player = self.state.current_player
+        self._commit_elapsed_time(player)
         self.game_record.append(self._record_move(move, player, self.move_number + 1))
         self.state.apply_move(move)
+        gives_check = self.state.is_in_check(self.state.current_player)
+        self.game_record[-1]["check"] = gives_check
         self.last_move   = move
         self.move_number += 1
+        self._value_eval_dirty = True
+        self.status_msg = "CHECK!" if gives_check else ""
+        self._turn_started_at = time.monotonic()
         self._deselect()
 
     def _record_move(self, move: Move, player: Color, move_number: int) -> dict:
@@ -422,6 +782,7 @@ class ChessUI:
             "promotion": move.promotion.name if move.promotion else None,
             "is_drop": move.is_drop,
             "drop_piece": move.drop_piece.name if move.drop_piece else None,
+            "check": False,
         }
 
     def _deselect(self) -> None:
@@ -448,8 +809,64 @@ class ChessUI:
     # AI management
     # -----------------------------------------------------------------
 
+    def _elapsed_current_turn(self) -> float:
+        return max(0.0, time.monotonic() - self._turn_started_at)
+
+    def _clock_snapshot(self, color: Color) -> tuple[float, float]:
+        main = max(0.0, self._clock_remaining[color])
+        byoyomi = float(self.byoyomi_sec)
+
+        if (self.state is not None
+                and not self._is_replay
+                and self._time_winner is None
+                and self._resign_winner is None
+                and color == self.state.current_player):
+            elapsed = self._elapsed_current_turn()
+            if main > 0:
+                if elapsed <= main:
+                    return main - elapsed, byoyomi
+                return 0.0, max(0.0, byoyomi - (elapsed - main))
+            return 0.0, max(0.0, byoyomi - elapsed)
+
+        return main, byoyomi
+
+    def _commit_elapsed_time(self, color: Color) -> None:
+        if (self._is_replay
+                or self._time_winner is not None
+                or self._resign_winner is not None):
+            return
+
+        elapsed = self._elapsed_current_turn()
+        main = self._clock_remaining[color]
+        if main > 0:
+            spent_main = min(main, elapsed)
+            self._clock_remaining[color] = max(0.0, main - spent_main)
+            elapsed -= spent_main
+        if self._clock_remaining[color] <= 0 and elapsed > self.byoyomi_sec:
+            self._time_winner = color.opponent()
+
+    def _check_time_forfeit(self) -> None:
+        if (self._is_replay
+                or self.state is None
+                or self._time_winner is not None
+                or self._resign_winner is not None):
+            return
+        main_left, move_left = self._clock_snapshot(self.state.current_player)
+        if main_left <= 0 and move_left <= 0:
+            self._time_winner = self.state.current_player.opponent()
+            self.status_msg = "Time forfeiture"
+
+    def _format_time(self, seconds: float) -> str:
+        seconds = max(0.0, seconds)
+        minutes = int(seconds // 60)
+        secs = int(seconds % 60)
+        return f"{minutes:02d}:{secs:02d}"
+
     def _maybe_start_ai(self) -> None:
-        if self._ai_busy or self.state.is_terminal():
+        if (self._ai_busy
+                or self.state.is_terminal()
+                or self._time_winner is not None
+                or self._resign_winner is not None):
             return
         if self._is_human_turn():
             return
@@ -478,6 +895,8 @@ class ChessUI:
             return
 
         self._ai_busy = False
+        if self._time_winner is not None or self._resign_winner is not None:
+            return
         if tag == "move":
             move: Move = payload
             # Small pause so AI moves are visible in AI vs AI
@@ -487,7 +906,309 @@ class ChessUI:
         else:
             self.status_msg = f"AI error: {payload}"
 
-    def _save_game_record(self) -> Optional[str]:
+    def _get_front_winrate(self) -> Optional[float]:
+        """Return the near-side (White) win probability in percent."""
+        if self.state is None:
+            return None
+
+        if self._resign_winner is not None:
+            self._front_winrate = 100.0 if self._resign_winner == Color.WHITE else 0.0
+            self._value_eval_dirty = False
+            return self._front_winrate
+
+        if not self._value_eval_dirty:
+            return self._front_winrate
+
+        if self.state.is_terminal():
+            winner = self.state.get_winner()
+            if winner == Color.WHITE:
+                self._front_winrate = 100.0
+            if winner == Color.BLACK:
+                self._front_winrate = 0.0
+            if winner is None:
+                self._front_winrate = 50.0
+            self._value_eval_dirty = False
+            return self._front_winrate
+
+        if self._shared_agent is None:
+            self._front_winrate = None
+            self._value_eval_dirty = False
+            return None
+
+        try:
+            import torch
+            from ai.network import state_to_tensor
+
+            agent = self._shared_agent
+            agent.network.eval()
+            obs = state_to_tensor(self.state, agent.device)
+            with torch.no_grad():
+                _, value_t = agent.network(obs)
+            current_value = float(value_t[0, 0].item())
+
+            # The network value is from the side-to-move perspective.
+            # The near side in this UI is White, so flip Black-to-move values.
+            front_value = (current_value if self.state.current_player == Color.WHITE
+                           else -current_value)
+            self._front_winrate = max(0.0, min(100.0, (front_value + 1.0) * 50.0))
+        except Exception as e:
+            self._front_winrate = None
+            self.status_msg = f"Value eval error: {e}"
+        finally:
+            self._value_eval_dirty = False
+
+        return self._front_winrate
+
+    def _fit_text_tail(self, text: str, font: pygame.font.Font, max_width: int) -> str:
+        if font.size(text)[0] <= max_width:
+            return text
+        fitted = text
+        while fitted and font.size(fitted)[0] > max_width:
+            fitted = fitted[1:]
+        return fitted
+
+    def _wrap_dialog_text(
+        self,
+        text: str,
+        font: pygame.font.Font,
+        max_width: int,
+    ) -> list[str]:
+        if not text:
+            return [""]
+
+        lines: list[str] = []
+        current = ""
+        for ch in text:
+            if ch == "\n":
+                lines.append(current)
+                current = ""
+                continue
+            candidate = current + ch
+            if current and font.size(candidate)[0] > max_width:
+                lines.append(current)
+                current = ch
+            else:
+                current = candidate
+        lines.append(current)
+        return lines
+
+    def _draw_dialog_text_input(
+        self,
+        rect: pygame.Rect,
+        label: str,
+        text: str,
+        active: bool,
+        multiline: bool = False,
+    ) -> None:
+        label_s = self.font_sm.render(label, True, (70, 70, 70))
+        self.screen.blit(label_s, (rect.x, rect.y - 26))
+
+        pygame.draw.rect(self.screen, (250, 250, 250), rect, border_radius=6)
+        border = (45, 105, 180) if active else (150, 150, 150)
+        pygame.draw.rect(self.screen, border, rect, width=2, border_radius=6)
+
+        display_text = text + ("|" if active else "")
+        color = (25, 25, 25)
+        if multiline:
+            line_h = self.font_sm.get_linesize()
+            max_lines = max(1, (rect.h - 14) // line_h)
+            lines = self._wrap_dialog_text(display_text, self.font_sm, rect.w - 20)
+            visible = lines[-max_lines:]
+            y = rect.y + 8
+            for line in visible:
+                line_s = self.font_sm.render(line, True, color)
+                self.screen.blit(line_s, (rect.x + 10, y))
+                y += line_h
+        else:
+            fitted = self._fit_text_tail(display_text, self.font_md, rect.w - 20)
+            text_s = self.font_md.render(fitted, True, color)
+            self.screen.blit(text_s, text_s.get_rect(midleft=(rect.x + 10, rect.centery)))
+
+    def _show_save_record_dialog(self) -> None:
+        if self.state is None:
+            return
+
+        default_name = f"{self.game_mode or 'unknown'}_{self.move_number:03d}moves"
+        save_name = default_name
+        memo = ""
+        active_field = "name"
+        status_msg = ""
+        input_limit = {"name": 80, "memo": 300}
+
+        dialog = pygame.Rect(0, 0, 560, 380)
+        dialog.center = (self.W // 2, self.H // 2)
+        name_rect = pygame.Rect(dialog.x + 36, dialog.y + 96, dialog.w - 72, 42)
+        memo_rect = pygame.Rect(dialog.x + 36, dialog.y + 178, dialog.w - 72, 84)
+        save_rect = pygame.Rect(dialog.centerx - 170, dialog.bottom - 66, 150, 44)
+        cancel_rect = pygame.Rect(dialog.centerx + 20, dialog.bottom - 66, 150, 44)
+        complete_msg = "Save Completed！"
+
+        def draw(status: str = "") -> None:
+            self._draw_frame()
+            overlay = pygame.Surface((self.W, self.H), pygame.SRCALPHA)
+            overlay.fill((0, 0, 0, 130))
+            self.screen.blit(overlay, (0, 0))
+
+            pygame.draw.rect(self.screen, (250, 250, 250), dialog, border_radius=10)
+            pygame.draw.rect(self.screen, (120, 120, 120), dialog, width=2, border_radius=10)
+            title_s = self.font_lg.render("Save Record", True, (25, 25, 25))
+            self.screen.blit(title_s, title_s.get_rect(center=(dialog.centerx, dialog.y + 42)))
+
+            self._draw_dialog_text_input(
+                name_rect, "Save name", save_name, active_field == "name")
+            self._draw_dialog_text_input(
+                memo_rect, "Memo", memo, active_field == "memo", multiline=True)
+
+            if status:
+                status_color = (200, 40, 40) if status == complete_msg else (60, 60, 60)
+                status_s = self.font_sm.render(status, True, status_color)
+                self.screen.blit(status_s, status_s.get_rect(center=(dialog.centerx, dialog.bottom - 92)))
+
+            mx, my = pygame.mouse.get_pos()
+            self._draw_rect_button(save_rect, "Save", mx, my, font=self.font_sm)
+            self._draw_rect_button(cancel_rect, "Cancel", mx, my, font=self.font_sm)
+            pygame.display.flip()
+
+        def commit_save() -> bool:
+            nonlocal status_msg
+            draw("Saving...")
+            try:
+                self._save_game_record(save_name, memo)
+            except Exception as e:
+                status_msg = f"Save failed: {e}"
+                return False
+
+            draw(complete_msg)
+            pygame.time.delay(800)
+            return True
+
+        try:
+            while True:
+                draw(status_msg)
+                for ev in pygame.event.get():
+                    if ev.type == pygame.QUIT:
+                        pygame.quit(); sys.exit()
+
+                    if ev.type == pygame.KEYDOWN:
+                        if ev.key == pygame.K_ESCAPE:
+                            return
+                        if ev.key == pygame.K_TAB:
+                            active_field = "memo" if active_field == "name" else "name"
+                            continue
+                        if ev.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                            if active_field == "name":
+                                active_field = "memo"
+                            else:
+                                if commit_save():
+                                    return
+                            continue
+                        if ev.key == pygame.K_BACKSPACE:
+                            if active_field == "name":
+                                save_name = save_name[:-1]
+                            else:
+                                memo = memo[:-1]
+                            continue
+
+                        if ev.unicode and ev.unicode.isprintable():
+                            if active_field == "name" and len(save_name) < input_limit["name"]:
+                                save_name += ev.unicode
+                            elif active_field == "memo" and len(memo) < input_limit["memo"]:
+                                memo += ev.unicode
+
+                    if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
+                        if name_rect.collidepoint(ev.pos):
+                            active_field = "name"
+                        elif memo_rect.collidepoint(ev.pos):
+                            active_field = "memo"
+                        elif save_rect.collidepoint(ev.pos):
+                            if commit_save():
+                                return
+                        elif cancel_rect.collidepoint(ev.pos):
+                            return
+
+                self.clock.tick(self.FPS)
+        finally:
+            self._turn_started_at = time.monotonic()
+
+    def _show_resign_dialog(self) -> None:
+        if self.state is None or self._is_replay or self._resign_winner is not None:
+            return
+
+        dialog = pygame.Rect(0, 0, 360, 180)
+        dialog.center = (self.W // 2, self.H // 2)
+        yes_rect = pygame.Rect(dialog.centerx - 115, dialog.bottom - 58, 90, 36)
+        no_rect = pygame.Rect(dialog.centerx + 25, dialog.bottom - 58, 90, 36)
+
+        try:
+            while True:
+                self._draw_frame()
+                overlay = pygame.Surface((self.W, self.H), pygame.SRCALPHA)
+                overlay.fill((0, 0, 0, 135))
+                self.screen.blit(overlay, (0, 0))
+
+                pygame.draw.rect(self.screen, (250, 250, 250), dialog, border_radius=10)
+                pygame.draw.rect(self.screen, (135, 135, 135), dialog, width=2, border_radius=10)
+                title = self.font_lg.render("Really Quit？", True, (210, 30, 30))
+                self.screen.blit(title, title.get_rect(center=(dialog.centerx, dialog.y + 62)))
+
+                mx, my = pygame.mouse.get_pos()
+                self._draw_rect_button(yes_rect, "Yes", mx, my, font=self.font_sm)
+                self._draw_rect_button(no_rect, "No", mx, my, font=self.font_sm)
+                pygame.display.flip()
+
+                for ev in pygame.event.get():
+                    if ev.type == pygame.QUIT:
+                        pygame.quit(); sys.exit()
+                    if ev.type == pygame.KEYDOWN and ev.key == pygame.K_ESCAPE:
+                        return
+                    if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
+                        if yes_rect.collidepoint(ev.pos):
+                            resigned = self.state.current_player
+                            self._commit_elapsed_time(resigned)
+                            self._resign_winner = resigned.opponent()
+                            self._value_eval_dirty = True
+                            self.status_msg = (
+                                "White resigned."
+                                if resigned == Color.WHITE else "Black resigned."
+                            )
+                            self._deselect()
+                            return
+                        if no_rect.collidepoint(ev.pos):
+                            return
+
+                self.clock.tick(self.FPS)
+        finally:
+            self._turn_started_at = time.monotonic()
+
+    def _safe_record_filename_part(self, text: str) -> str:
+        illegal = set('<>:"/\\|?*')
+        cleaned = []
+        for ch in text.strip():
+            if ch in illegal or ord(ch) < 32:
+                cleaned.append("_")
+            elif ch.isspace():
+                cleaned.append("_")
+            else:
+                cleaned.append(ch)
+
+        part = "".join(cleaned).strip(" ._")
+        while "__" in part:
+            part = part.replace("__", "_")
+        return part[:64] or "record"
+
+    def _unique_record_path(self, record_dir: str, stem: str) -> str:
+        path = os.path.join(record_dir, f"{stem}.json")
+        if not os.path.exists(path):
+            return path
+
+        idx = 2
+        while True:
+            candidate = os.path.join(record_dir, f"{stem}_{idx}.json")
+            if not os.path.exists(candidate):
+                return candidate
+            idx += 1
+
+    def _save_game_record(self, save_name: str = "", memo: str = "") -> Optional[str]:
         if self.state is None:
             return None
 
@@ -496,9 +1217,12 @@ class ChessUI:
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         mode = self.game_mode or "unknown"
-        path = os.path.join(record_dir, f"{timestamp}_{mode}_{self.move_number:03d}moves.json")
+        default_name = f"{mode}_{self.move_number:03d}moves"
+        display_name = save_name.strip() or default_name
+        filename_part = self._safe_record_filename_part(display_name)
+        path = self._unique_record_path(record_dir, f"{timestamp}_{filename_part}")
 
-        winner = self.state.get_winner()
+        winner = self._resign_winner or self._time_winner or self.state.get_winner()
         if winner == Color.WHITE:
             result = "white_win"
         elif winner == Color.BLACK:
@@ -511,10 +1235,22 @@ class ChessUI:
         data = {
             "game": "Chess x Shogi",
             "mode": mode,
+            "save_name": display_name,
+            "memo": memo.strip(),
             "started_at": self._game_started_at,
             "saved_at": datetime.now().isoformat(timespec="seconds"),
+            "first_color": "white" if self.first_color == Color.WHITE else "black",
+            "time_control": {
+                "main_time_sec": self.main_time_sec,
+                "byoyomi_sec": self.byoyomi_sec,
+            },
             "move_count": self.move_number,
             "result": result,
+            "ending": (
+                "resign" if self._resign_winner is not None
+                else "time" if self._time_winner is not None
+                else "normal"
+            ),
             "moves": self.game_record,
             "final_board": repr(self.state),
         }
@@ -525,6 +1261,332 @@ class ChessUI:
         self._last_saved_record = path
         self.status_msg = f"Saved: {os.path.basename(path)}"
         return path
+
+    def _record_paths(self, record_dir: str) -> list[str]:
+        return sorted(
+            [
+                p for p in (os.path.join(record_dir, name) for name in os.listdir(record_dir))
+                if os.path.isfile(p) and p.lower().endswith(".json")
+            ],
+            key=lambda p: os.path.getmtime(p),
+            reverse=True,
+        )
+
+    def _delete_record_files(self, paths: list[str], record_dir: str) -> tuple[int, int]:
+        root = os.path.normcase(os.path.abspath(record_dir))
+        prefix = root + os.sep
+        deleted = 0
+        errors = 0
+
+        for path in paths:
+            target = os.path.normcase(os.path.abspath(path))
+            if not target.startswith(prefix):
+                errors += 1
+                continue
+            if not target.lower().endswith(".json"):
+                errors += 1
+                continue
+            try:
+                if os.path.isfile(path):
+                    os.remove(path)
+                    deleted += 1
+            except OSError:
+                errors += 1
+
+        return deleted, errors
+
+    def _confirm_record_delete(self, count: int) -> bool:
+        if count <= 0:
+            return False
+
+        base = self.screen.copy()
+        dialog = pygame.Rect(0, 0, 470, 220)
+        dialog.center = (self.W // 2, self.H // 2)
+        delete_rect = pygame.Rect(dialog.centerx - 160, dialog.bottom - 66, 135, 42)
+        cancel_rect = pygame.Rect(dialog.centerx + 25, dialog.bottom - 66, 135, 42)
+
+        while True:
+            self.screen.blit(base, (0, 0))
+            overlay = pygame.Surface((self.W, self.H), pygame.SRCALPHA)
+            overlay.fill((0, 0, 0, 135))
+            self.screen.blit(overlay, (0, 0))
+
+            pygame.draw.rect(self.screen, (250, 250, 250), dialog, border_radius=10)
+            pygame.draw.rect(self.screen, (135, 135, 135), dialog, width=2, border_radius=10)
+            title = self.font_lg.render("Delete GameRecord?", True, (210, 30, 30))
+            self.screen.blit(title, title.get_rect(center=(dialog.centerx, dialog.y + 52)))
+            detail = self.font_sm.render(
+                f"Delete {count} record(s). This cannot be undone.",
+                True,
+                (40, 40, 40),
+            )
+            self.screen.blit(detail, detail.get_rect(center=(dialog.centerx, dialog.y + 105)))
+
+            mx, my = pygame.mouse.get_pos()
+            self._draw_rect_button(
+                delete_rect, "Delete", mx, my, font=self.font_sm, text_color=(255, 220, 220))
+            self._draw_rect_button(cancel_rect, "Cancel", mx, my, font=self.font_sm)
+            pygame.display.flip()
+
+            for ev in pygame.event.get():
+                if ev.type == pygame.QUIT:
+                    pygame.quit(); sys.exit()
+                if ev.type == pygame.KEYDOWN and ev.key == pygame.K_ESCAPE:
+                    return False
+                if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
+                    if delete_rect.collidepoint(ev.pos):
+                        return True
+                    if cancel_rect.collidepoint(ev.pos):
+                        return False
+
+            self.clock.tick(self.FPS)
+
+    def _show_record_list(self) -> None:
+        record_dir = os.path.join(self.asset_dir, "gamerecord")
+        os.makedirs(record_dir, exist_ok=True)
+        selected: set[str] = set()
+        status_msg = ""
+
+        while True:
+            records = self._record_paths(record_dir)
+            selected.intersection_update(records)
+
+            self.screen.fill(_C["bg"])
+            title = self.font_lg.render("Replay GameRecord", True, _C["text"])
+            self.screen.blit(title, title.get_rect(center=(self.W // 2, 70)))
+
+            mx, my = pygame.mouse.get_pos()
+            buttons: List[tuple[pygame.Rect, str, Optional[str]]] = []
+            y = 125
+            row_h = 44
+            if not records:
+                msg = self.font_md.render("No saved records.", True, _C["text2"])
+                self.screen.blit(msg, msg.get_rect(center=(self.W // 2, 210)))
+
+            for path in records[:12]:
+                check_rect = pygame.Rect(112, y + 5, 26, 26)
+                row_rect = pygame.Rect(152, y, self.W - 500, row_h - 6)
+                delete_rect = pygame.Rect(self.W - 320, y, 120, row_h - 6)
+                mtime = datetime.fromtimestamp(os.path.getmtime(path)).strftime("%Y-%m-%d %H:%M:%S")
+                label = f"{mtime}  {os.path.basename(path)}"
+
+                pygame.draw.rect(self.screen, (245, 245, 245), check_rect, border_radius=4)
+                pygame.draw.rect(
+                    self.screen,
+                    _C["hl_hand"] if path in selected else (145, 145, 145),
+                    check_rect,
+                    width=2,
+                    border_radius=4,
+                )
+                if path in selected:
+                    mark = self.font_sm.render("X", True, (35, 35, 35))
+                    self.screen.blit(mark, mark.get_rect(center=check_rect.center))
+
+                display = self._fit_text_tail(label, self.font_sm, row_rect.w - 20)
+                self._draw_rect_button(row_rect, display, mx, my, font=self.font_sm)
+                self._draw_rect_button(
+                    delete_rect, "Delete", mx, my, font=self.font_sm,
+                    text_color=(255, 220, 220),
+                )
+                buttons.append((check_rect, "select", path))
+                buttons.append((row_rect, "open", path))
+                buttons.append((delete_rect, "delete_one", path))
+                y += row_h
+
+            if status_msg:
+                status = self.font_sm.render(status_msg, True, (220, 150, 70))
+                self.screen.blit(status, status.get_rect(center=(self.W // 2, self.H - 122)))
+
+            delete_selected = pygame.Rect(150, self.H - 80, 260, 46)
+            delete_all = pygame.Rect((self.W - 220) // 2, self.H - 80, 220, 46)
+            back = pygame.Rect(self.W - 410, self.H - 80, 220, 46)
+            self._draw_rect_button(
+                delete_selected,
+                f"Delete Selected ({len(selected)})",
+                mx,
+                my,
+                font=self.font_sm,
+                text_color=(255, 220, 220),
+            )
+            self._draw_rect_button(
+                delete_all, "Delete All", mx, my, font=self.font_sm,
+                text_color=(255, 220, 220))
+            self._draw_rect_button(back, "Back", mx, my)
+            buttons.append((delete_selected, "delete_selected", None))
+            buttons.append((delete_all, "delete_all", None))
+            buttons.append((back, "back", None))
+
+            pygame.display.flip()
+
+            for ev in pygame.event.get():
+                if ev.type == pygame.QUIT:
+                    pygame.quit(); sys.exit()
+                if ev.type == pygame.KEYDOWN and ev.key == pygame.K_ESCAPE:
+                    self._show_menu()
+                    return
+                if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
+                    for rect, action, path in buttons:
+                        if not rect.collidepoint(ev.pos):
+                            continue
+                        if action == "select" and path:
+                            if path in selected:
+                                selected.remove(path)
+                            else:
+                                selected.add(path)
+                            break
+                        if action == "open" and path:
+                            self._load_replay_record(path)
+                            self._replay_loop()
+                            return
+                        if action == "delete_one" and path:
+                            if self._confirm_record_delete(1):
+                                deleted, errors = self._delete_record_files([path], record_dir)
+                                selected.discard(path)
+                                status_msg = f"Deleted {deleted} record(s)."
+                                if errors:
+                                    status_msg += f" Failed: {errors}."
+                            break
+                        if action == "delete_selected":
+                            if not selected:
+                                status_msg = "No records selected."
+                                break
+                            targets = list(selected)
+                            if self._confirm_record_delete(len(targets)):
+                                deleted, errors = self._delete_record_files(targets, record_dir)
+                                selected.clear()
+                                status_msg = f"Deleted {deleted} record(s)."
+                                if errors:
+                                    status_msg += f" Failed: {errors}."
+                            break
+                        if action == "delete_all":
+                            if not records:
+                                status_msg = "No records to delete."
+                                break
+                            if self._confirm_record_delete(len(records)):
+                                deleted, errors = self._delete_record_files(records, record_dir)
+                                selected.clear()
+                                status_msg = f"Deleted {deleted} record(s)."
+                                if errors:
+                                    status_msg += f" Failed: {errors}."
+                            break
+                        if action == "back":
+                            self._show_menu()
+                            return
+
+    def _load_replay_record(self, path: str) -> None:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        self._is_replay = True
+        self.game_mode = "replay"
+        self.ai_white = None
+        self.ai_black = None
+        self._ai_busy = False
+        self._time_winner = None
+        self._resign_winner = None
+        self._replay_auto = False
+        self._replay_last_step = time.monotonic()
+        self._replay_moves = list(data.get("moves", []))
+        self._replay_source_name = os.path.basename(path)
+        self.first_color = Color.BLACK if data.get("first_color") == "black" else Color.WHITE
+        self.status_msg = ""
+        self._set_replay_index(0)
+
+    def _move_from_record(self, rec: dict) -> Move:
+        promotion = PieceType[rec["promotion"]] if rec.get("promotion") else None
+        drop_piece = PieceType[rec["drop_piece"]] if rec.get("drop_piece") else None
+        from_pos = tuple(rec["from"]) if rec.get("from") is not None else None
+        to_pos = tuple(rec["to"])
+        return Move(
+            from_pos=from_pos,
+            to_pos=to_pos,
+            promotion=promotion,
+            is_drop=bool(rec.get("is_drop", False)),
+            drop_piece=drop_piece,
+        )
+
+    def _set_replay_index(self, index: int) -> None:
+        self._replay_index = max(0, min(index, len(self._replay_moves)))
+        state = GameState()
+        state.current_player = self.first_color
+        state.position_history = [state._position_key()]
+        last_move = None
+        for rec in self._replay_moves[:self._replay_index]:
+            move = self._move_from_record(rec)
+            state.apply_move(move)
+            last_move = move
+        self.state = state
+        self.last_move = last_move
+        self.move_number = self._replay_index
+        self.selected_square = None
+        self.selected_hand = None
+        self.highlight_squares = []
+        self._front_winrate = None
+        self._value_eval_dirty = True
+
+    def _replay_buttons(self) -> List[tuple[pygame.Rect, str, str]]:
+        x = 8
+        y = 210
+        w = 25
+        h = 34
+        gap = 3
+        play_label = "□" if self._replay_auto else "▶"
+        items = [
+            ("<<", "start"),
+            ("<", "prev"),
+            (play_label, "play"),
+            (">", "next"),
+            (">>", "end"),
+        ]
+        return [
+            (pygame.Rect(x + i * (w + gap), y, w, h), label, action)
+            for i, (label, action) in enumerate(items)
+        ]
+
+    def _replay_loop(self) -> None:
+        while self._is_replay:
+            self.clock.tick(self.FPS)
+            now = time.monotonic()
+            if self._replay_auto and now - self._replay_last_step >= 1.0:
+                if self._replay_index < len(self._replay_moves):
+                    self._set_replay_index(self._replay_index + 1)
+                    self._replay_last_step = now
+                else:
+                    self._replay_auto = False
+
+            self._handle_replay_events()
+            self._draw_frame()
+            pygame.display.flip()
+
+    def _handle_replay_events(self) -> None:
+        for ev in pygame.event.get():
+            if ev.type == pygame.QUIT:
+                pygame.quit(); sys.exit()
+            if ev.type == pygame.KEYDOWN and ev.key == pygame.K_ESCAPE:
+                self._replay_auto = False
+                self._is_replay = False
+                self._show_menu()
+                return
+            if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
+                for rect, _label, action in self._replay_buttons():
+                    if not rect.collidepoint(ev.pos):
+                        continue
+                    if action == "start":
+                        self._replay_auto = False
+                        self._set_replay_index(0)
+                    elif action == "prev":
+                        self._replay_auto = False
+                        self._set_replay_index(self._replay_index - 1)
+                    elif action == "play":
+                        self._replay_auto = not self._replay_auto
+                        self._replay_last_step = time.monotonic()
+                    elif action == "next":
+                        self._replay_auto = False
+                        self._set_replay_index(self._replay_index + 1)
+                    elif action == "end":
+                        self._replay_auto = False
+                        self._set_replay_index(len(self._replay_moves))
+                    return
 
     # -----------------------------------------------------------------
     # Promotion dialog
@@ -650,12 +1712,15 @@ class ChessUI:
 
     def _draw_frame(self) -> None:
         self.screen.fill(_C["bg"])
-        self._draw_info_panel()
+        if self._is_replay:
+            self._draw_replay_info_panel()
+        else:
+            self._draw_info_panel()
         self._draw_board()
         self._draw_pieces()
         self._draw_highlights()
-        self._draw_hand_panel(Color.WHITE)
         self._draw_hand_panel(Color.BLACK)
+        self._draw_hand_panel(Color.WHITE)
 
     def _draw_board(self) -> None:
         self.screen.blit(self.board_img, (self.BX, self.BY))
@@ -730,9 +1795,27 @@ class ChessUI:
                                      self.W - self.HAND_X - 4, self.BH)
             pygame.draw.rect(self.screen, _C["panel"], panel_rect, border_radius=8)
 
+        section_y = self.BY if color == Color.BLACK else self.BY + self.BH // 2
+        section_h = self.BH // 2
+        is_current = (
+            not self._is_replay
+            and self.state is not None
+            and self.state.current_player == color
+            and self._time_winner is None
+            and self._resign_winner is None
+        )
+        if is_current:
+            section_rect = pygame.Rect(
+                self.HAND_X + 4,
+                section_y + 4,
+                self.W - self.HAND_X - 12,
+                section_h - 8,
+            )
+            pygame.draw.rect(self.screen, _C["hl_hand"], section_rect, width=2, border_radius=8)
+
         # Section title
         label = "White's hand" if color == Color.WHITE else "Black's hand"
-        lbl_s = self.font_sm.render(label, True, _C["text2"])
+        lbl_s = self.font_sm.render(label, True, _C["text"] if is_current else _C["text2"])
         if color == Color.BLACK:
             self.screen.blit(lbl_s, (self.HAND_X + 10, self.BY + 6))
         else:
@@ -794,17 +1877,48 @@ class ChessUI:
                                   True, _C["text2"])
         self.screen.blit(hc, (10, y)); y += 26
 
+        winrate = self._get_front_winrate()
+        wr_text = "Front win: --" if winrate is None else f"Front win: {winrate:.1f}%"
+        wr_color = _C["text2"] if winrate is None else _C["text"]
+        wr = self.font_sm.render(wr_text, True, wr_color)
+        self.screen.blit(wr, (10, y)); y += 26
+
+        for color, name in ((Color.WHITE, "White"), (Color.BLACK, "Black")):
+            main_left, move_left = self._clock_snapshot(color)
+            active = (
+                self.state.current_player == color
+                and self._time_winner is None
+                and self._resign_winner is None
+            )
+            side = "First" if color == self.first_color else "Second"
+            label_col = _C["text"] if active else _C["text2"]
+            line1 = self.font_xs.render(f"{name} ({side})", True, label_col)
+            line2 = self.font_xs.render(
+                f"Main {self._format_time(main_left)}  Move {move_left:04.1f}s",
+                True,
+                label_col,
+            )
+            self.screen.blit(line1, (10, y)); y += 18
+            self.screen.blit(line2, (10, y)); y += 20
+        y += 6
+
         # Check indicator
         if self.state.is_in_check(self.state.current_player):
             chk = self.font_md.render("CHECK!", True, _C["hl_check"])
             self.screen.blit(chk, (10, y)); y += 32
 
-        # Save button
+        # Resign / save buttons
         mx, my = pygame.mouse.get_pos()
-        hover = self._save_btn_rect.collidepoint(mx, my)
-        pygame.draw.rect(self.screen, _C["btn_hover"] if hover else _C["btn"],
+        resign_hover = self._resign_btn_rect.collidepoint(mx, my)
+        pygame.draw.rect(self.screen, _C["btn_hover"] if resign_hover else _C["btn"],
+                         self._resign_btn_rect, border_radius=6)
+        resign_s = self.font_sm.render("Resign", True, _C["btn_txt"])
+        self.screen.blit(resign_s, resign_s.get_rect(center=self._resign_btn_rect.center))
+
+        save_hover = self._save_btn_rect.collidepoint(mx, my)
+        pygame.draw.rect(self.screen, _C["btn_hover"] if save_hover else _C["btn"],
                          self._save_btn_rect, border_radius=6)
-        save_s = self.font_sm.render("Save GameRecord", True, _C["btn_txt"])
+        save_s = self.font_sm.render("Save Record", True, _C["btn_txt"])
         self.screen.blit(save_s, save_s.get_rect(center=self._save_btn_rect.center))
 
         # Game mode
@@ -823,53 +1937,94 @@ class ChessUI:
             sm = self.font_sm.render(self.status_msg, True, (220, 120, 60))
             self.screen.blit(sm, (10, self.H - 110))
 
+    def _draw_replay_info_panel(self) -> None:
+        panel = pygame.Rect(0, 0, self.BX - 4, self.H)
+        pygame.draw.rect(self.screen, _C["panel"], panel)
+
+        y = 26
+        title = self.font_md.render("Replay", True, _C["text"])
+        self.screen.blit(title, (10, y)); y += 34
+
+        source = self._replay_source_name
+        if len(source) > 18:
+            source = source[:15] + "..."
+        src = self.font_xs.render(source, True, _C["text2"])
+        self.screen.blit(src, (10, y)); y += 32
+
+        progress = self.font_sm.render(
+            f"Move {self._replay_index}/{len(self._replay_moves)}",
+            True,
+            _C["text"],
+        )
+        self.screen.blit(progress, (10, y)); y += 34
+
+        hint = self.font_xs.render("0  -1  play  +1  end", True, _C["text2"])
+        self.screen.blit(hint, (10, y)); y += 38
+
+        mx, my = pygame.mouse.get_pos()
+        for rect, label, action in self._replay_buttons():
+            text_color = (220, 30, 30) if action == "play" and label == "▶" else None
+            self._draw_rect_button(rect, label, mx, my, font=self.font_sm, text_color=text_color)
+
+        esc_s = self.font_sm.render("[ESC] Top", True, _C["text2"])
+        self.screen.blit(esc_s, (10, self.H - 56))
+
     # -----------------------------------------------------------------
     # Game-over screen
     # -----------------------------------------------------------------
 
     def _show_game_over(self) -> None:
-        winner = self.state.get_winner()
-        if winner == Color.WHITE:
-            headline = "White wins!"
-            col = (230, 220, 180)
-        elif winner == Color.BLACK:
-            headline = "Black wins!"
-            col = (140, 140, 160)
+        if self._resign_winner is not None:
+            headline = "Resign"
+            detail = "White wins" if self._resign_winner == Color.WHITE else "Black wins"
+        elif self._time_winner is not None:
+            headline = "Time Up"
+            detail = "White wins" if self._time_winner == Color.WHITE else "Black wins"
+        elif self.state.is_checkmate():
+            headline = "Check Mate"
+            winner = self.state.get_winner()
+            detail = "White wins" if winner == Color.WHITE else "Black wins"
+        elif self.state.is_stalemate():
+            headline = "Stale Mate"
+            detail = "Draw"
         else:
-            if self.state.is_stalemate():
-                headline = "Stalemate — Draw"
-            else:
-                headline = "Draw"
-            col = _C["text"]
+            headline = "Draw"
+            detail = "Draw"
 
-        bw, bh = 260, 56
+        box = pygame.Rect(self.BX + 135, self.BY + 140, self.BW - 270, 310)
+        bw, bh = 145, 38
 
         while True:
             self._draw_frame()
 
             overlay = pygame.Surface((self.W, self.H), pygame.SRCALPHA)
-            overlay.fill((0, 0, 0, 160))
+            overlay.fill((0, 0, 0, 95))
             self.screen.blit(overlay, (0, 0))
 
-            ht = self.font_lg.render(headline, True, col)
-            self.screen.blit(ht, ht.get_rect(center=(self.W//2, self.H//2 - 60)))
+            pygame.draw.rect(self.screen, (250, 250, 245), box, border_radius=8)
+            pygame.draw.rect(self.screen, (220, 220, 210), box, width=2, border_radius=8)
+
+            ht = self.font_lg.render(headline, True, (210, 30, 30))
+            self.screen.blit(ht, ht.get_rect(center=(box.centerx, box.y + 76)))
+            dt = self.font_md.render(detail, True, (35, 35, 35))
+            self.screen.blit(dt, dt.get_rect(center=(box.centerx, box.y + 122)))
 
             mx, my  = pygame.mouse.get_pos()
             buttons = [
-                (pygame.Rect((self.W - bw)//2, self.H//2,       bw, bh), "Save GameRecord"),
-                (pygame.Rect((self.W - bw)//2, self.H//2 + 70,  bw, bh), "Play again"),
-                (pygame.Rect((self.W - bw)//2, self.H//2 + 140, bw, bh), "Main menu"),
+                (pygame.Rect(box.centerx - bw - 12, box.bottom - 118, bw, bh), "Replay"),
+                (pygame.Rect(box.centerx + 12,      box.bottom - 118, bw, bh), "Top"),
+                (pygame.Rect(box.centerx - 190,     box.bottom - 68, 380, bh), "Save Record"),
             ]
             for rect, label in buttons:
                 hover = rect.collidepoint(mx, my)
                 pygame.draw.rect(self.screen, _C["btn_hover"] if hover else _C["btn"],
-                                 rect, border_radius=10)
-                lbl = self.font_md.render(label, True, _C["btn_txt"])
+                                 rect, border_radius=7)
+                lbl = self.font_sm.render(label, True, _C["btn_txt"])
                 self.screen.blit(lbl, lbl.get_rect(center=rect.center))
 
             if self.status_msg:
-                sm = self.font_sm.render(self.status_msg, True, (230, 210, 150))
-                self.screen.blit(sm, sm.get_rect(center=(self.W//2, self.H//2 + 220)))
+                sm = self.font_sm.render(self.status_msg, True, (80, 80, 80))
+                self.screen.blit(sm, sm.get_rect(center=(box.centerx, box.bottom - 18)))
 
             pygame.display.flip()
 
@@ -879,11 +2034,11 @@ class ChessUI:
                 if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
                     for rect, label in buttons:
                         if rect.collidepoint(ev.pos):
-                            if label == "Save GameRecord":
-                                self._save_game_record()
-                            elif label == "Play again":
+                            if label == "Replay":
                                 self._start_game(self.game_mode)
                                 return
-                            else:
+                            if label == "Top":
                                 self._show_menu()
                                 return
+                            if label == "Save Record":
+                                self._show_save_record_dialog()

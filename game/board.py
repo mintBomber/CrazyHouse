@@ -6,8 +6,7 @@ Variant rules vs standard chess:
      square as the player's own piece (shogi-style).
   2. A pawn may NOT be dropped on the opponent's back rank (rank 8 for White,
      rank 1 for Black).
-  3. A pawn drop that immediately checkmates the opponent is illegal
-     (打ち歩詰禁止, equivalent to shogi rule).
+  3. A drop that immediately checkmates the opponent is illegal.
   4. Kings are never captured; game ends by checkmate.
 
 Board coordinate convention:
@@ -305,7 +304,7 @@ class GameState:
                     moves.extend(self._king_moves(r, c, player))
         return moves
 
-    def _pseudo_drop_moves(self, apply_pawn_mate_filter: bool = True) -> List[Move]:
+    def _pseudo_drop_moves(self, apply_drop_mate_filter: bool = True) -> List[Move]:
         """Generate all pseudo-legal drop moves for the current player."""
         player     = self.current_player
         hand       = self.hands[player]
@@ -324,23 +323,22 @@ class GameState:
                         continue
                     drop_moves.append(Move(None,(r,c), is_drop=True, drop_piece=pt))
 
-        if not apply_pawn_mate_filter:
+        if not apply_drop_mate_filter:
             return drop_moves
 
-        # Filter: pawn drop that checkmates the opponent is illegal (打ち歩詰禁止)
+        # Filter: any drop that immediately checkmates the opponent is illegal.
         opp   = player.opponent()
         legal: List[Move] = []
         for mv in drop_moves:
-            if mv.drop_piece == PieceType.PAWN:
-                test = self.copy()
-                test._apply_unchecked(mv)
-                # Check if opponent is in checkmate (no legal reply)
-                if test.is_in_check(opp):
-                    test.current_player = opp
-                    # Use base (no pawn-mate-filter) to avoid infinite recursion
-                    replies = test._get_legal_moves_base()
-                    if not replies:
-                        continue   # drop-pawn checkmate is illegal
+            test = self.copy()
+            test._apply_unchecked(mv)
+            # Check if opponent is in checkmate (no legal reply).
+            if test.is_in_check(opp):
+                test.current_player = opp
+                # Use base (no drop-mate filter) to avoid infinite recursion.
+                replies = test._get_legal_moves_base()
+                if not replies:
+                    continue
             legal.append(mv)
         return legal
 
@@ -350,12 +348,12 @@ class GameState:
 
     def _get_legal_moves_base(self) -> List[Move]:
         """
-        Legal moves WITHOUT the pawn-drop-checkmate filter.
-        Used internally to avoid infinite recursion in 打ち歩詰 check.
+        Legal moves WITHOUT the drop-checkmate filter.
+        Used internally to avoid infinite recursion in drop-mate checks.
         """
         player    = self.current_player
         pseudo    = self._pseudo_board_moves() + self._pseudo_drop_moves(
-            apply_pawn_mate_filter=False)
+            apply_drop_mate_filter=False)
         legal: List[Move] = []
 
         for mv in pseudo:
@@ -375,7 +373,7 @@ class GameState:
         """All legal moves for the current player including variant drop rules."""
         player    = self.current_player
         pseudo    = self._pseudo_board_moves() + self._pseudo_drop_moves(
-            apply_pawn_mate_filter=True)
+            apply_drop_mate_filter=True)
         legal: List[Move] = []
 
         for mv in pseudo:

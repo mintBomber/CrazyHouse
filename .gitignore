@@ -27,6 +27,8 @@ checkpoints/*
 # Saved game records
 gamerecord/*
 !gamerecord/.gitkeep
+selfplay_records/*
+!selfplay_records/.gitkeep
 
 # Logs and local run output
 *.log
@@ -40,3 +42,8 @@ log_*.txt
 Thumbs.db
 .vscode/
 .idea/
+
+＃others
+refine_plan.md
+training_parameters_guide.md
+training_config_presets.md

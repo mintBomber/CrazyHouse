@@ -4,8 +4,8 @@ game:
 
 ai:
   device: "cpu"          # "cuda" for GPU acceleration
-  mcts_simulations: 100 #400  # Simulations per move
-  gumbel_K: 16           # Top-K candidates for Gumbel selection (root)
+  mcts_simulations: 25 #400  # Simulations per move
+  gumbel_K: 8 #16           # Top-K candidates for Gumbel selection (root)
   c_puct: 1.25           # PUCT exploration constant (non-root nodes)
   dirichlet_alpha: 0.3   # Dirichlet noise alpha for root exploration
   dirichlet_eps: 0.25    # Fraction of Dirichlet noise added to root prior
@@ -14,28 +14,30 @@ ai:
   value_scale: 1.0       # Scale factor for value head output
 
 network:
-  num_res_blocks: 10     # Number of residual blocks
-  channels: 256          # Feature channels per layer
+  num_res_blocks: 3 #10     # Number of residual blocks
+  channels: 64 #256          # Feature channels per layer
   policy_channels: 2     # Policy head intermediate channels
   value_channels: 1      # Value head intermediate channels
-  value_fc_size: 256     # Value head fully-connected hidden size
+  value_fc_size: 128 #256     # Value head fully-connected hidden size
   input_planes: 28       # Number of input feature planes (see state encoding)
 
 training:
-  run_name: "run_10000_games"           # Checkpoints are saved under checkpoints/{run_name}
-  total_iterations: 100        # Total training iterations for this run
+  run_name: "run_quick_cpu" #"run_10000_games"           # Checkpoints are saved under checkpoints/{run_name}
+  total_iterations: 20 #100        # Total training iterations for this run
   checkpoint_dir: "checkpoints" # Root checkpoint directory
-  save_every_n_iters: 10        # Save iter_XXXXX.pt every N iterations
+  save_every_n_iters: 2 #10        # Save iter_XXXXX.pt every N iterations
   keep_last_n_checkpoints: 10    # 0 = keep all iter_XXXXX.pt files
   resume: true                  # Resume from checkpoints/{run_name}/latest.pt when present
-  batch_size: 256
+  batch_size: 128 #256
   lr: 0.001
   lr_decay_steps: [100000, 300000]
   lr_decay_gamma: 0.1
   weight_decay: 0.0001
-  num_self_play_games: 100      # Self-play games per training iteration
-  num_epochs: 10                # Training epochs per iteration
-  buffer_size: 100000           # Replay buffer capacity
+  num_self_play_games: 10 #100      # Self-play games per training iteration
+  num_epochs: 3 #10                # Training epochs per iteration
+  buffer_size: 20000 #100000           # Replay buffer capacity
+  save_self_play_records: true      # Save each self-play game as JSON
+  self_play_record_dir: "selfplay_records" # Saved under selfplay_records/{run_name}
 
 ui:
   window_width: 1200
