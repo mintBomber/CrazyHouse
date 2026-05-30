@@ -13,7 +13,8 @@ GUI は Pygame、AI は Gumbel AlphaZero 形式の MCTS + ResNet で実装して
 6. [AI 学習](#6-ai-学習)
 7. [設定ファイル](#7-設定ファイル)
 8. [ファイル構成](#8-ファイル構成)
-9. [テスト](#9-テスト)
+9. [EXE 化](#9-exe-化)
+10. [テスト](#10-テスト)
 
 ## 1. セットアップ
 
@@ -71,6 +72,10 @@ AI 学習のみ実行:
 python -m ai.train
 ```
 
+GUI から追加学習する場合は、トップ画面の `Model Learning` を開きます。
+`Iterations` は現在の `run_name` に対して追加で回すイテレーション数です。
+完了後、次回の AI 対局や評価表示では更新された `latest.pt` を読み込みます。
+
 ## 3. ゲーム画面と操作
 
 ### トップ画面
@@ -81,8 +86,9 @@ python -m ai.train
 | --- | --- |
 | `Player vs Player` | 人間同士で対戦 |
 | `Player vs AI` | 人間と AI が対戦 |
-| `AI vs AI` | AI 同士の自動対戦を観戦 |
-| `Replay GameRecord` | 保存済み棋譜を再生 |
+| `AI vs AI` | AI 同士の自動対戦を観戦。複数対局も指定可能 |
+| `Replay` | 保存済み棋譜を再生 |
+| `Model Learning` | GUI から追加学習を実行 |
 | `Quit` | アプリを終了 |
 
 ### 対局前設定
@@ -91,14 +97,23 @@ python -m ai.train
 
 | 項目 | 内容 |
 | --- | --- |
+| `Variant` | Crazy House / Standard のルール選択 |
 | `First move` | 白番・黒番のどちらを先手にするか |
 | `Human side` | Player vs AI で人間が先手か後手か |
 | `Player 1` | Player vs Player で Player 1 が先手か後手か |
 | `Main time (min)` | 各プレイヤーの持ち時間。範囲は `0-60` 分 |
 | `One-move time (sec)` | 持ち時間を使い切った後の 1 手秒読み。範囲は `0-600` 秒 |
+| `Matches (AI vs AI)` | AI vs AI の連続対局数。範囲は `1-1000` |
 
 `Main time` と `One-move time` は、`+` / `-` ボタンでも、数字欄の直接入力でも変更できます。
 `One-move time` は 1 秒単位で変化します。
+
+AI vs AI で `Matches (AI vs AI)` を `2` 以上にすると、指定回数だけ連続対局します。
+完了後に勝敗数・平均手数のリザルト画面が表示され、結果 JSON は次に保存されます。
+
+```text
+aivai_results\
+```
 
 ### 対局中の操作
 
@@ -122,6 +137,7 @@ python -m ai.train
 - 現在の手番
 - 手数
 - 50 手ルールカウンタ
+- 読み込んだ AI モデルの学習イテレーション数
 - `Front win`、手前側の白番視点の勝率
 - 白黒それぞれの残り持ち時間と 1 手秒読み
 - `CHECK!` 表示
@@ -180,10 +196,11 @@ python -m ai.train
 | --- | --- |
 | 空きマスのみ | 既に駒があるマスには打てない |
 | ポーン最終段打ち禁止 | 白ポーンは 8 段目、黒ポーンは 1 段目に打てない |
-| 打ち駒即詰み禁止 | 持ち駒を打ったその手で相手を即チェックメイトにする手は不合法 |
+| ポーン打ち即詰み禁止 | ポーンを打ったその手で相手を即チェックメイトにする手は不合法 |
 
 持ち駒打ちでチェックを掛けること自体は合法です。
-ただし、その打ち駒が即詰みになる場合は、ポーン以外の駒でも不合法になります。
+ただし、ポーン打ちが即詰みになる場合だけは不合法です。
+ポーン以外の持ち駒打ちで即詰みになる手は合法です。
 
 ### チェック表示
 
@@ -234,7 +251,7 @@ gamerecord\20260529_153012_my_game.json
 
 ### 棋譜再生
 
-トップ画面の `Replay GameRecord` から、`gamerecord\` 内の棋譜を一覧表示できます。
+トップ画面の `Replay` から、`gamerecord\` 内の棋譜を一覧表示できます。
 
 一覧画面でできること:
 
@@ -261,6 +278,18 @@ gamerecord\20260529_153012_my_game.json
 | `>>` | 最終局面へ進める |
 
 ## 6. AI 学習
+
+### GUI から追加学習
+
+トップ画面の `Model Learning` では、以下を指定して追加学習できます。
+
+| 項目 | 内容 |
+| --- | --- |
+| `Iterations` | 追加で回す学習イテレーション数。範囲は `1-9999` |
+| `Rule` | Crazy House / Standard |
+
+`Execute` を押すとバックグラウンドで学習が始まり、進行画面には `Now: 3 / 20 steps` の形式で進捗が表示されます。
+ここでの `steps` は追加イテレーション数です。
 
 ### 学習の流れ
 
@@ -448,6 +477,7 @@ config\config.yaml
 | `num_self_play_games` | 1 イテレーションあたりの自己対戦局数 |
 | `num_epochs` | 1 イテレーションあたりの学習 epoch 数 |
 | `buffer_size` | replay buffer の最大サンプル数 |
+| `drop_mode` | 自己対戦学習で Crazy House の持ち駒ルールを使うか |
 | `save_self_play_records` | 自己対戦棋譜 JSON を保存するか |
 | `self_play_record_dir` | 自己対戦棋譜の保存先ルート |
 
@@ -475,6 +505,7 @@ config\config.yaml
 Game02/
 ├── main.py
 ├── requirements.txt
+├── CrazyHouse.spec
 ├── chess_board.png
 ├── chess_pieces.png
 ├── config/
@@ -496,7 +527,9 @@ Game02/
 │   └── .gitkeep
 ├── gamerecord/
 │   └── .gitkeep
-└── selfplay_records/
+├── selfplay_records/
+│   └── .gitkeep
+└── aivai_results/
     └── .gitkeep
 ```
 
@@ -512,6 +545,7 @@ Game02/
 | `ai/train.py` | 自己対戦学習 |
 | `ui/assets.py` | 画像読み込み |
 | `ui/ui.py` | Pygame UI、棋譜保存、再生、投了、時間管理 |
+| `CrazyHouse.spec` | PyInstaller 用ビルド設定 |
 
 ### Git 管理対象外のデータ
 
@@ -521,6 +555,7 @@ Game02/
 checkpoints/*
 gamerecord/*
 selfplay_records/*
+aivai_results/*
 *.pt
 *.pth
 *.ckpt
@@ -529,7 +564,19 @@ selfplay_records/*
 
 各フォルダの `.gitkeep` だけを管理対象にしています。
 
-## 9. テスト
+## 9. EXE 化
+
+PyInstaller を使う場合は、次のようにビルドします。
+
+```powershell
+pip install pyinstaller
+pyinstaller CrazyHouse.spec --clean
+```
+
+生成物は `dist\CrazyHouse\` に出力されます。
+PyTorch を含むため、EXE は大きくなります。
+
+## 10. テスト
 
 持ち駒と打ち駒に関する回帰テストがあります。
 
@@ -543,4 +590,5 @@ python -m unittest discover -s tests
 - 白の持ち駒打ちは白い駒として置かれる
 - 黒の持ち駒打ちは黒い駒として置かれる
 - チェックになる持ち駒打ちは合法
-- 即詰みになる持ち駒打ちは不合法
+- 即詰みになるポーン打ちは不合法
+- ポーン以外の即詰み打ちは合法

@@ -6,7 +6,7 @@ Variant rules vs standard chess:
      square as the player's own piece (shogi-style).
   2. A pawn may NOT be dropped on the opponent's back rank (rank 8 for White,
      rank 1 for Black).
-  3. A pawn drop that immediately checkmates the opponent is illegal (Uchi-fu-zume).
+  3. A pawn drop that immediately checkmates the opponent is illegal.
   4. Kings are never captured; game ends by checkmate.
 
 Board coordinate convention:
@@ -310,7 +310,7 @@ class GameState:
                     moves.extend(self._king_moves(r, c, player))
         return moves
 
-    def _pseudo_drop_moves(self, apply_pawn_mate_filter: bool = True) -> List[Move]:
+    def _pseudo_drop_moves(self, apply_drop_mate_filter: bool = True) -> List[Move]:
         """Generate all pseudo-legal drop moves for the current player."""
         if not self.drop_mode:
             return []
@@ -331,11 +331,11 @@ class GameState:
                         continue
                     drop_moves.append(Move(None,(r,c), is_drop=True, drop_piece=pt))
 
-        if not apply_pawn_mate_filter:
+        if not apply_drop_mate_filter:
             return drop_moves
 
-        # Filter: only pawn drops that immediately checkmate are illegal (Uchi-fu-zume).
-        # Drops of other pieces that cause immediate checkmate are fully legal.
+        # Variant rule: only pawn drops that immediately checkmate are illegal.
+        # _get_legal_moves_base disables this filter to avoid recursive mate checks.
         opp   = player.opponent()
         legal: List[Move] = []
         for mv in drop_moves:
@@ -363,7 +363,7 @@ class GameState:
         """
         player    = self.current_player
         pseudo    = self._pseudo_board_moves() + self._pseudo_drop_moves(
-            apply_pawn_mate_filter=False)
+            apply_drop_mate_filter=False)
         legal: List[Move] = []
 
         for mv in pseudo:
@@ -386,7 +386,7 @@ class GameState:
         """All legal moves for the current player including variant drop rules."""
         player    = self.current_player
         pseudo    = self._pseudo_board_moves() + self._pseudo_drop_moves(
-            apply_pawn_mate_filter=True)
+            apply_drop_mate_filter=True)
         legal: List[Move] = []
 
         for mv in pseudo:

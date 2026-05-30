@@ -34,10 +34,12 @@ class AIAgent:
 
         self.network = build_network(net_cfg, device)
         checkpoint_path = _resolve_checkpoint_path(cfg, checkpoint_path)
+        self.trained_iteration = 0
 
         if checkpoint_path and os.path.isfile(checkpoint_path):
             ckpt = _torch_load_checkpoint(checkpoint_path, device)
             self.network.load_state_dict(ckpt["model_state_dict"])
+            self.trained_iteration = int(ckpt.get("iteration", 0))
             print(f"[AIAgent] Loaded checkpoint: {checkpoint_path}")
         elif checkpoint_path:
             print(f"[AIAgent] Checkpoint not found: {checkpoint_path}")

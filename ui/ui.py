@@ -27,6 +27,7 @@ import queue
 import sys
 import threading
 import time
+import copy
 from datetime import datetime
 from typing import Any, List, Optional, Tuple
 
@@ -182,6 +183,9 @@ class ChessUI:
         self._setup_human_side = "first"
         self._setup_main_minutes = 5
         self._setup_byoyomi_seconds = 10
+        self._setup_aivai_matches = 1
+        self._learn_iterations = 20
+        self._learn_drop_mode = True
         self._setup_active_field: Optional[str] = None
         self._setup_input_text = ""
         self.first_color = Color.WHITE
@@ -217,6 +221,10 @@ class ChessUI:
 
         # Status message
         self.status_msg = ""
+
+        # AI vs AI batch state
+        self._aivai_total_matches = 0
+        self._aivai_current_match = 0
 
     # -----------------------------------------------------------------
     # Public entry point
@@ -269,6 +277,7 @@ class ChessUI:
             ("Player  vs  AI",      "pvai"),
             ("AI  vs  AI",          "aivai"),
             ("Replay",               "replay"),
+            ("Model Learning",       "learn"),
         ]
         bw, bh = 340, 60
         spacing = 24
@@ -291,7 +300,9 @@ class ChessUI:
                 rect = pygame.Rect(bx, by, bw, bh)
                 btn_rects.append((rect, mode))
                 hover = rect.collidepoint(mx, my)
-                if mode == "replay":
+                if mode == "learn":
+                    color = (255, 140, 195) if hover else (240, 103, 166)
+                elif mode == "replay":
                     color = (80, 170, 100) if hover else (55, 130, 75)
                 else:
                     color = _C["btn_hover"] if hover else _C["btn"]
@@ -313,9 +324,197 @@ class ChessUI:
                         if rect.collidepoint(self._to_logical(ev.pos)):
                             if mode == "replay":
                                 self._show_record_list()
+                            elif mode == "learn":
+                                self._show_learn_setup()
                             else:
                                 self._show_game_setup(mode)
                             return
+
+    def _show_learn_setup(self) -> None:
+        """Configure and start background self-play training from the UI."""
+        self._deactivate_setup_input()
+        center_x = self.W // 2
+        bw, bh = 260, 46
+
+        while True:
+            self.screen.fill(_C["bg"])
+            title = self.font_lg.render("Model Learning", True, (240, 103, 166))
+            self.screen.blit(title, title.get_rect(center=(center_x, 95)))
+
+            subtitle = self.font_sm.render(
+                "Runs additional training iterations for the current run.",
+                True,
+                _C["text2"],
+            )
+            self.screen.blit(subtitle, subtitle.get_rect(center=(center_x, 145)))
+
+            mx, my = self._to_logical(pygame.mouse.get_pos())
+            buttons: List[tuple[pygame.Rect, str]] = []
+
+            y = 230
+            self._draw_setup_stepper(
+                "Iterations",
+                y,
+                "learn_minus",
+                "learn_plus",
+                buttons,
+                input_action="learn_input",
+                value_text=str(self._learn_iterations),
+                active=self._setup_active_field == "learn_iters",
+                range_text="(1-9999)",
+            )
+
+            y += 86
+            self._draw_setup_label("Rule", y)
+            buttons.extend(self._draw_choice_pair(
+                y,
+                "Crazy House",
+                "learn_drop_on",
+                "Standard",
+                "learn_drop_off",
+                self._learn_drop_mode,
+            ))
+
+            exec_rect = pygame.Rect(center_x - bw - 12, y + 112, bw, bh + 6)
+            cancel_rect = pygame.Rect(center_x + 12, y + 112, bw, bh + 6)
+            buttons.extend([(exec_rect, "execute"), (cancel_rect, "cancel")])
+
+            exec_col = (255, 140, 195) if exec_rect.collidepoint(mx, my) else (240, 103, 166)
+            pygame.draw.rect(self.screen, exec_col, exec_rect, border_radius=8)
+            exec_s = self.font_md.render("Execute", True, _C["btn_txt"])
+            self.screen.blit(exec_s, exec_s.get_rect(center=exec_rect.center))
+            self._draw_rect_button(cancel_rect, "Cancel", mx, my)
+
+            self._flip()
+
+            for ev in pygame.event.get():
+                if ev.type == pygame.QUIT:
+                    pygame.quit(); sys.exit()
+                if ev.type == pygame.KEYDOWN:
+                    if self._handle_setup_key(ev):
+                        continue
+                    if ev.key == pygame.K_ESCAPE:
+                        self._deactivate_setup_input()
+                        self._show_menu()
+                        return
+                if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
+                    clicked_any = False
+                    for rect, action in buttons:
+                        if not rect.collidepoint(self._to_logical(ev.pos)):
+                            continue
+                        clicked_any = True
+                        if action == "learn_minus":
+                            self._deactivate_setup_input()
+                            self._learn_iterations = max(1, self._learn_iterations - 1)
+                        elif action == "learn_plus":
+                            self._deactivate_setup_input()
+                            self._learn_iterations = min(9999, self._learn_iterations + 1)
+                        elif action == "learn_input":
+                            self._activate_setup_input("learn_iters", self._learn_iterations)
+                        elif action == "learn_drop_on":
+                            self._deactivate_setup_input()
+                            self._learn_drop_mode = True
+                        elif action == "learn_drop_off":
+                            self._deactivate_setup_input()
+                            self._learn_drop_mode = False
+                        elif action == "execute":
+                            self._deactivate_setup_input()
+                            self._show_learn_progress(self._learn_iterations, self._learn_drop_mode)
+                            return
+                        elif action == "cancel":
+                            self._deactivate_setup_input()
+                            self._show_menu()
+                            return
+                        break
+                    if not clicked_any:
+                        self._deactivate_setup_input()
+
+            self.clock.tick(self.FPS)
+
+    def _show_learn_progress(self, total_iters: int, drop_mode: bool) -> None:
+        """Run training in a background thread and display coarse progress."""
+        progress = {"step": 0, "done": False, "error": None}
+        progress_lock = threading.Lock()
+
+        def set_progress(step: int) -> None:
+            with progress_lock:
+                progress["step"] = max(0, min(total_iters, int(step)))
+
+        def set_done(error: Optional[str] = None) -> None:
+            with progress_lock:
+                if error:
+                    progress["error"] = error
+                progress["done"] = True
+
+        def worker() -> None:
+            try:
+                from ai.train import main as train_main
+
+                cfg_copy = copy.deepcopy(self.cfg)
+                cfg_copy.setdefault("training", {})
+                cfg_copy["training"]["additional_iterations"] = int(total_iters)
+                cfg_copy["training"]["drop_mode"] = bool(drop_mode)
+                cfg_copy["_project_root"] = self.asset_dir
+                train_main(argv=[], cfg_override=cfg_copy, progress_cb=set_progress)
+            except Exception as e:
+                set_done(str(e))
+                return
+            set_progress(total_iters)
+            set_done()
+
+        threading.Thread(target=worker, daemon=True).start()
+
+        ok_rect = pygame.Rect(self.W // 2 - 90, self.H // 2 + 98, 180, 48)
+        bar_w, bar_h = 440, 20
+        bar_x = self.W // 2 - bar_w // 2
+        bar_y = self.H // 2 + 34
+
+        while True:
+            self.clock.tick(self.FPS)
+            with progress_lock:
+                step = int(progress["step"])
+                done = bool(progress["done"])
+                error = progress["error"]
+
+            self.screen.fill(_C["bg"])
+            if done:
+                if error:
+                    title_text = self._fit_text_tail(f"Error: {error}", self.font_md, self.W - 160)
+                    title = self.font_md.render(title_text, True, (220, 80, 80))
+                else:
+                    title = self.font_lg.render("Completed!", True, (100, 220, 120))
+                self.screen.blit(title, title.get_rect(center=(self.W // 2, self.H // 2 - 46)))
+            else:
+                title = self.font_lg.render("Model Learning", True, (240, 103, 166))
+                self.screen.blit(title, title.get_rect(center=(self.W // 2, self.H // 2 - 70)))
+                now = self.font_md.render(f"Now: {step} / {total_iters} steps", True, _C["text"])
+                self.screen.blit(now, now.get_rect(center=(self.W // 2, self.H // 2 - 20)))
+
+            pygame.draw.rect(self.screen, (60, 60, 65), (bar_x, bar_y, bar_w, bar_h), border_radius=4)
+            fill = int(bar_w * step / max(1, total_iters))
+            if fill > 0:
+                pygame.draw.rect(self.screen, (240, 103, 166), (bar_x, bar_y, fill, bar_h), border_radius=4)
+            pygame.draw.rect(self.screen, _C["text2"], (bar_x, bar_y, bar_w, bar_h),
+                             width=1, border_radius=4)
+
+            if done:
+                mx, my = self._to_logical(pygame.mouse.get_pos())
+                self._draw_rect_button(ok_rect, "OK", mx, my)
+
+            self._flip()
+
+            for ev in pygame.event.get():
+                if ev.type == pygame.QUIT:
+                    pygame.quit(); sys.exit()
+                if done and ev.type == pygame.KEYDOWN and ev.key == pygame.K_ESCAPE:
+                    self._shared_agent = None
+                    self._show_menu()
+                    return
+                if done and ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
+                    if ok_rect.collidepoint(self._to_logical(ev.pos)):
+                        self._shared_agent = None
+                        self._show_menu()
+                        return
 
     # -----------------------------------------------------------------
     # Game startup
@@ -386,6 +585,17 @@ class ChessUI:
                 range_text="(0-600)",
             )
 
+            if mode == "aivai":
+                y += 74
+                self._draw_setup_stepper(
+                    "Matches (AI vs AI)",
+                    y, "match_minus", "match_plus", buttons,
+                    input_action="match_input",
+                    value_text=str(self._setup_aivai_matches),
+                    active=self._setup_active_field == "matches",
+                    range_text="(1-1000)",
+                )
+
             start_rect = pygame.Rect(center_x - bw - 12, y + 90, bw, bh + 6)
             back_rect = pygame.Rect(center_x + 12, y + 90, bw, bh + 6)
             buttons.extend([(start_rect, "start"), (back_rect, "back")])
@@ -443,6 +653,14 @@ class ChessUI:
                             self._setup_byoyomi_seconds = min(600, self._setup_byoyomi_seconds + 1)
                         elif action == "byo_input":
                             self._activate_setup_input("byoyomi", self._setup_byoyomi_seconds)
+                        elif action == "match_minus":
+                            self._deactivate_setup_input()
+                            self._setup_aivai_matches = max(1, self._setup_aivai_matches - 1)
+                        elif action == "match_plus":
+                            self._deactivate_setup_input()
+                            self._setup_aivai_matches = min(1000, self._setup_aivai_matches + 1)
+                        elif action == "match_input":
+                            self._activate_setup_input("matches", self._setup_aivai_matches)
                         elif action == "start":
                             self._deactivate_setup_input()
                             self._start_game(mode)
@@ -493,6 +711,10 @@ class ChessUI:
             self._setup_main_minutes = max(0, min(60, value))
         elif self._setup_active_field == "byoyomi":
             self._setup_byoyomi_seconds = max(0, min(600, value))
+        elif self._setup_active_field == "matches":
+            self._setup_aivai_matches = max(1, min(1000, value))
+        elif self._setup_active_field == "learn_iters":
+            self._learn_iterations = max(1, min(9999, value))
 
     def _handle_setup_key(self, ev: pygame.event.Event) -> bool:
         if self._setup_active_field is None:
@@ -508,7 +730,12 @@ class ChessUI:
             self._setup_input_text = self._setup_input_text[:-1]
             return True
         if ev.unicode and ev.unicode.isdigit():
-            max_len = 2 if self._setup_active_field == "main" else 3
+            if self._setup_active_field == "main":
+                max_len = 2
+            elif self._setup_active_field in ("byoyomi", "matches"):
+                max_len = 3
+            else:
+                max_len = 4
             if len(self._setup_input_text) < max_len:
                 self._setup_input_text += ev.unicode
             return True
@@ -577,6 +804,14 @@ class ChessUI:
         self.screen.blit(text, text.get_rect(center=rect.center))
 
     def _start_game(self, mode: str) -> None:
+        if mode == "aivai" and self._setup_aivai_matches > 1:
+            self._aivai_loop(self._setup_aivai_matches)
+            return
+
+        self._prepare_game(mode)
+        self._game_loop()
+
+    def _prepare_game(self, mode: str) -> None:
         self.game_mode   = mode
         self.state       = GameState()
         self.state.drop_mode = self._setup_drop_mode
@@ -591,6 +826,7 @@ class ChessUI:
         self.status_msg  = ""
         self._promo_pending = None
         self._ai_busy    = False
+        self._ai_queue   = queue.Queue()
         self.game_record = []
         self._game_started_at = datetime.now().isoformat(timespec="seconds")
         self._last_saved_record = None
@@ -617,6 +853,7 @@ class ChessUI:
         if mode == "pvp":
             self.ai_white = None
             self.ai_black = None
+            self._get_shared_agent()
         elif mode == "pvai":
             agent = self._get_shared_agent()
             self.ai_white = None if self.human_color == Color.WHITE else agent
@@ -626,8 +863,6 @@ class ChessUI:
             self.ai_white = agent
             self.ai_black = agent
 
-        self._game_loop()
-
     def _get_shared_agent(self):
         if self._shared_agent is None:
             from ai.agent import AIAgent
@@ -635,15 +870,157 @@ class ChessUI:
             self._value_eval_dirty = True
         return self._shared_agent
 
+    def _aivai_loop(self, total_matches: int) -> None:
+        """Run several AI vs AI games and show a compact result screen."""
+        total_matches = max(1, min(1000, int(total_matches)))
+        stats = {
+            "first_wins": 0,
+            "second_wins": 0,
+            "white_wins": 0,
+            "black_wins": 0,
+            "draws": 0,
+            "total_turns": 0,
+            "games": [],
+        }
+
+        self._aivai_total_matches = total_matches
+        try:
+            for match_idx in range(1, total_matches + 1):
+                self._aivai_current_match = match_idx
+                self._prepare_game("aivai")
+                self._aivai_total_matches = total_matches
+                self._aivai_current_match = match_idx
+                self.status_msg = f"AI vs AI {match_idx} / {total_matches}"
+                self._game_loop(show_game_over=False, allow_escape=False)
+
+                winner = self._resign_winner or self._time_winner or self.state.get_winner()
+                winner_label = "draw"
+                winner_order = "draw"
+                if winner == Color.WHITE:
+                    stats["white_wins"] += 1
+                    winner_label = "white"
+                elif winner == Color.BLACK:
+                    stats["black_wins"] += 1
+                    winner_label = "black"
+
+                if winner is None:
+                    stats["draws"] += 1
+                elif winner == self.first_color:
+                    stats["first_wins"] += 1
+                    winner_order = "first"
+                else:
+                    stats["second_wins"] += 1
+                    winner_order = "second"
+
+                ending = "draw"
+                if self._time_winner is not None:
+                    ending = "time"
+                elif self._resign_winner is not None:
+                    ending = "resign"
+                elif self.state.is_checkmate():
+                    ending = "checkmate"
+                elif self.state.is_stalemate():
+                    ending = "stalemate"
+
+                stats["total_turns"] += self.move_number
+                stats["games"].append({
+                    "match": match_idx,
+                    "winner": winner_label,
+                    "winner_order": winner_order,
+                    "turns": self.move_number,
+                    "ending": ending,
+                })
+        finally:
+            self._aivai_current_match = 0
+            self._aivai_total_matches = 0
+
+        saved_path = self._save_aivai_result(stats, total_matches)
+        self._show_aivai_result(stats, total_matches, saved_path)
+
+    def _save_aivai_result(self, stats: dict, total_matches: int) -> str:
+        out_dir = os.path.join(self.asset_dir, "aivai_results")
+        os.makedirs(out_dir, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = os.path.join(out_dir, f"aivai_{timestamp}.json")
+        avg_turns = stats["total_turns"] / total_matches if total_matches else 0.0
+        data = {
+            "game": "Chess x Shogi",
+            "mode": "aivai_batch",
+            "total_matches": total_matches,
+            "first_wins": stats["first_wins"],
+            "second_wins": stats["second_wins"],
+            "white_wins": stats["white_wins"],
+            "black_wins": stats["black_wins"],
+            "draws": stats["draws"],
+            "average_turns": round(avg_turns, 2),
+            "first_color": "white" if self.first_color == Color.WHITE else "black",
+            "variant": "crazy_house" if self._setup_drop_mode else "standard",
+            "time_control": {
+                "main_time_sec": self.main_time_sec,
+                "byoyomi_sec": self.byoyomi_sec,
+            },
+            "saved_at": datetime.now().isoformat(timespec="seconds"),
+            "games": stats["games"],
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        self.status_msg = f"Saved: {os.path.basename(path)}"
+        return path
+
+    def _show_aivai_result(self, stats: dict, total_matches: int, saved_path: str) -> None:
+        avg_turns = stats["total_turns"] / total_matches if total_matches else 0.0
+        rule = "Crazy House" if self._setup_drop_mode else "Standard"
+        lines = [
+            f"Matches      : {total_matches}",
+            f"First wins   : {stats['first_wins']}",
+            f"Second wins  : {stats['second_wins']}",
+            f"Draws        : {stats['draws']}",
+            f"Average turns: {avg_turns:.1f}",
+            f"Rule         : {rule}",
+        ]
+        saved_name = os.path.basename(saved_path)
+        ok_rect = pygame.Rect(self.W // 2 - 120, self.H // 2 + 190, 240, 48)
+
+        while True:
+            self.screen.fill(_C["bg"])
+            title = self.font_lg.render("AI vs AI Result", True, _C["text"])
+            self.screen.blit(title, title.get_rect(center=(self.W // 2, 118)))
+
+            start_y = 190
+            for i, line in enumerate(lines):
+                line_s = self.font_md.render(line, True, _C["text"])
+                self.screen.blit(line_s, line_s.get_rect(center=(self.W // 2, start_y + i * 38)))
+
+            saved = self._fit_text_tail(f"Saved: {saved_name}", self.font_sm, self.W - 180)
+            saved_s = self.font_sm.render(saved, True, _C["text2"])
+            self.screen.blit(saved_s, saved_s.get_rect(center=(self.W // 2, self.H // 2 + 136)))
+
+            mx, my = self._to_logical(pygame.mouse.get_pos())
+            self._draw_rect_button(ok_rect, "Back to Menu", mx, my)
+            self._flip()
+
+            for ev in pygame.event.get():
+                if ev.type == pygame.QUIT:
+                    pygame.quit(); sys.exit()
+                if ev.type == pygame.KEYDOWN and ev.key == pygame.K_ESCAPE:
+                    self._show_menu()
+                    return
+                if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
+                    if ok_rect.collidepoint(self._to_logical(ev.pos)):
+                        self._show_menu()
+                        return
+
+            self.clock.tick(self.FPS)
+
     # -----------------------------------------------------------------
     # Game loop
     # -----------------------------------------------------------------
 
-    def _game_loop(self) -> None:
+    def _game_loop(self, show_game_over: bool = True, allow_escape: bool = True) -> None:
         while True:
             self.clock.tick(self.FPS)
             self._check_time_forfeit()
-            self._handle_events()
+            self._handle_events(allow_escape=allow_escape)
             self._check_ai_result()
             self._maybe_start_ai()
             self._draw_frame()
@@ -652,25 +1029,29 @@ class ChessUI:
             if (self._time_winner is not None
                     or self._resign_winner is not None
                     or self.state.is_terminal()):
-                self._show_game_over()
+                if show_game_over:
+                    self._show_game_over()
                 return
 
     # -----------------------------------------------------------------
     # Event handling
     # -----------------------------------------------------------------
 
-    def _handle_events(self) -> None:
+    def _handle_events(self, allow_escape: bool = True) -> None:
         for ev in pygame.event.get():
             if ev.type == pygame.QUIT:
                 pygame.quit(); sys.exit()
+
+            if ev.type == pygame.VIDEORESIZE:
+                pygame.display.set_mode((ev.w, ev.h), pygame.RESIZABLE)
+
+            if not allow_escape:
+                continue
 
             if ev.type == pygame.KEYDOWN:
                 if ev.key == pygame.K_ESCAPE:
                     self._show_escape_dialog()
                     return
-
-            if ev.type == pygame.VIDEORESIZE:
-                pygame.display.set_mode((ev.w, ev.h), pygame.RESIZABLE)
 
             if ev.type == pygame.MOUSEBUTTONDOWN:
                 if ev.button == 1:
@@ -905,13 +1286,15 @@ class ChessUI:
 
         self._ai_busy = True
         mn = self.move_number
+        state_snapshot = self.state.copy()
+        result_queue = self._ai_queue
 
         def worker():
             try:
-                move = agent.select_move(self.state.copy(), mn)
-                self._ai_queue.put(("move", move))
+                move = agent.select_move(state_snapshot, mn)
+                result_queue.put(("move", move))
             except Exception as e:
-                self._ai_queue.put(("error", str(e)))
+                result_queue.put(("error", str(e)))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -933,8 +1316,52 @@ class ChessUI:
         else:
             self.status_msg = f"AI error: {payload}"
 
+    # ------------------------------------------------------------------
+    # Material-count evaluation (always available, no network required)
+    # ------------------------------------------------------------------
+    _PIECE_MATERIAL = {1: 1, 2: 5, 3: 3, 4: 3, 5: 9, 6: 0}  # PieceType int → value
+
+    def _material_winrate(self) -> float:
+        """
+        White win-probability (0-100) based purely on material count.
+
+        Piece values: P=1 N=3 B=3 R=5 Q=9.
+        Hand pieces (Crazy House) are included.
+        Uses a logistic curve so that a ±1-queen advantage → ≈80% / 20%.
+        """
+        import math
+        state = self.state
+        white_mat = sum(self._PIECE_MATERIAL[abs(int(v))]
+                        for v in state.board.flat if v > 0)
+        black_mat = sum(self._PIECE_MATERIAL[abs(int(v))]
+                        for v in state.board.flat if v < 0)
+        if state.drop_mode:
+            for pt, val in self._PIECE_MATERIAL.items():
+                if pt == 6:
+                    continue
+                pt_obj = PieceType(pt)
+                white_mat += state.hands[Color.WHITE].get(pt_obj, 0) * val
+                black_mat += state.hands[Color.BLACK].get(pt_obj, 0) * val
+        diff = white_mat - black_mat
+        # scale=6: +9 pts (1 queen) ≈ 82%, +3 pts (1 minor) ≈ 62%
+        return 100.0 / (1.0 + math.exp(-diff / 6.0))
+
+    # ------------------------------------------------------------------
+
     def _get_front_winrate(self) -> Optional[float]:
-        """Return the near-side (White) win probability in percent."""
+        """
+        Return White win-probability (0-100).
+
+        When the neural network is available the result is a weighted blend of
+        the NN value head and the material-count evaluation.  The blend weight
+        is proportional to the NN's output magnitude: a network that has
+        barely trained produces values near 0.0 and is given low weight so the
+        material heuristic dominates; a well-trained network produces values
+        far from 0.0 and gradually takes over.
+
+          nn_weight = clamp(|nn_value| / 0.15, 0, 1)
+          winrate   = nn_weight * nn_winrate + (1 - nn_weight) * material_winrate
+        """
         if self.state is None:
             return None
 
@@ -947,7 +1374,7 @@ class ChessUI:
         if not self._value_eval_dirty:
             return self._front_winrate
 
-        # Show 50% at move 0 (game start = equal position, no evaluation needed yet)
+        # At move 0 the position is equal; skip the network call.
         if self.move_number == 0 and not self._is_replay:
             self._front_winrate = 50.0
             self._ai_candidates = None
@@ -956,21 +1383,22 @@ class ChessUI:
 
         if self.state.is_terminal():
             winner = self.state.get_winner()
-            if winner == Color.WHITE:
-                self._front_winrate = 100.0
-            if winner == Color.BLACK:
-                self._front_winrate = 0.0
-            if winner is None:
-                self._front_winrate = 50.0
+            self._front_winrate = (100.0 if winner == Color.WHITE
+                                   else 0.0 if winner == Color.BLACK
+                                   else 50.0)
             self._ai_candidates = None
             self._value_eval_dirty = False
             return self._front_winrate
 
+        # Material evaluation is always computed (no network required).
+        mat_wr = self._material_winrate()
+
         if self._shared_agent is None:
-            self._front_winrate = None
+            # No network: use pure material evaluation.
+            self._front_winrate = mat_wr
             self._ai_candidates = None
             self._value_eval_dirty = False
-            return None
+            return self._front_winrate
 
         try:
             import torch
@@ -983,13 +1411,18 @@ class ChessUI:
                 policy_logits, value_t = agent.network(obs)
             current_value = float(value_t[0, 0].item())
 
-            # The network value is from the side-to-move perspective.
-            # The near side in this UI is White, so flip Black-to-move values.
+            # Network value is from the side-to-move perspective; flip for Black.
             front_value = (current_value if self.state.current_player == Color.WHITE
                            else -current_value)
-            self._front_winrate = max(0.0, min(100.0, (front_value + 1.0) * 50.0))
+            nn_wr = max(0.0, min(100.0, (front_value + 1.0) * 50.0))
 
-            # Compute top candidate moves from policy head (same forward pass)
+            # Blend: weight NN by confidence (|value| / threshold).
+            # Untrained network ≈ 0.025 → nn_weight ≈ 0.17 → material dominates.
+            # Well-trained network ≈ 0.3+  → nn_weight ≈ 1.0  → NN dominates.
+            nn_weight = min(1.0, abs(front_value) / 0.15)
+            self._front_winrate = nn_weight * nn_wr + (1.0 - nn_weight) * mat_wr
+
+            # Candidate moves from policy head (same forward pass).
             probs = torch.softmax(policy_logits[0], dim=0).cpu().numpy()
             legal = self.state.get_legal_moves()
             if legal:
@@ -1003,7 +1436,7 @@ class ChessUI:
             else:
                 self._ai_candidates = None
         except Exception as e:
-            self._front_winrate = None
+            self._front_winrate = mat_wr   # fall back to material on error
             self._ai_candidates = None
             self.status_msg = f"Value eval error: {e}"
         finally:
@@ -1654,7 +2087,7 @@ class ChessUI:
         w = 25
         h = 34
         gap = 3
-        play_label = "||" if self._replay_auto else "Go"
+        play_label = "□" if self._replay_auto else "▶"
         items = [
             ("<<", "start"),
             ("<", "prev"),
@@ -2004,6 +2437,19 @@ class ChessUI:
                                   True, _C["text2"])
         self.screen.blit(hc, (10, y)); y += 26
 
+        if self._shared_agent is not None:
+            itr = getattr(self._shared_agent, "trained_iteration", 0)
+            itr_s = self.font_sm.render(f"Training: {itr}", True, _C["text2"])
+            self.screen.blit(itr_s, (10, y)); y += 26
+
+        if self._aivai_total_matches > 1 and self._aivai_current_match > 0:
+            match_s = self.font_sm.render(
+                f"Match: {self._aivai_current_match}/{self._aivai_total_matches}",
+                True,
+                _C["text2"],
+            )
+            self.screen.blit(match_s, (10, y)); y += 26
+
         winrate = self._get_front_winrate()
         bar_x = 10
         bar_w = max(60, self.BX - 30)
@@ -2127,7 +2573,7 @@ class ChessUI:
 
         mx, my = self._to_logical(pygame.mouse.get_pos())
         for rect, label, action in self._replay_buttons():
-            text_color = (220, 30, 30) if action == "play" and label == "Go" else None
+            text_color = (220, 30, 30) if action == "play" and label == "▶" else None
             self._draw_rect_button(rect, label, mx, my, font=self.font_sm, text_color=text_color)
 
         esc_s = self.font_sm.render("[ESC] Top", True, _C["text2"])

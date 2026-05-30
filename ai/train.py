@@ -61,6 +61,8 @@ def self_play_game(
     """
     planner   = GumbelMCTS(network, cfg["ai"])
     state     = GameState()
+    state.drop_mode = bool(cfg.get("training", {}).get("drop_mode", True))
+    state.position_history = [state._position_key()]
     samples: List[Tuple[np.ndarray, np.ndarray, Color]] = []
     moves: List[dict] = []
     max_moves = cfg["game"]["max_moves"]
@@ -237,6 +239,7 @@ def save_self_play_record(
         "iteration": iteration,
         "game_index": game_index,
         "step": completed_step,
+        "variant": "crazy_house" if cfg["training"].get("drop_mode", True) else "standard",
         "saved_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         **record,
     }
@@ -313,34 +316,46 @@ def _prune_old_checkpoints(cfg: dict, keep: int) -> None:
         print(f"  [train] Removed old checkpoint: {old}")
 
 
-def main(argv: List[str] | None = None):
+def main(argv: List[str] | None = None, cfg_override: dict | None = None, progress_cb=None):
     parser = argparse.ArgumentParser(
         description="Run self-play training using config/config.yaml"
     )
     parser.parse_args(argv)
 
-    config_path = os.path.join(PROJECT_ROOT, "config", "config.yaml")
-    with open(config_path, encoding="utf-8") as f:
-        cfg = yaml.safe_load(f)
+    if cfg_override is not None:
+        cfg = cfg_override
+    else:
+        config_path = os.path.join(PROJECT_ROOT, "config", "config.yaml")
+        with open(config_path, encoding="utf-8") as f:
+            cfg = yaml.safe_load(f)
 
     device      = cfg["ai"].get("device", "cpu")
     train_cfg   = cfg["training"]
     cfg["_project_root"] = PROJECT_ROOT
-    total_iterations = int(train_cfg.get("total_iterations", 0))
+    configured_total_iterations = int(train_cfg.get("total_iterations", 0))
+    additional_iterations = int(train_cfg.get("additional_iterations", 0))
     save_every = int(train_cfg.get("save_every_n_iters", 0))
     num_self_play_games = int(train_cfg["num_self_play_games"])
     save_self_play_records = bool(train_cfg.get("save_self_play_records", True))
 
-    if total_iterations < 1:
+    if configured_total_iterations < 1 and additional_iterations < 1:
         raise ValueError("training.total_iterations must be >= 1")
+    if additional_iterations < 0:
+        raise ValueError("training.additional_iterations must be >= 0")
     if save_every < 1:
         raise ValueError("training.save_every_n_iters must be >= 1")
     if num_self_play_games < 1:
         raise ValueError("training.num_self_play_games must be >= 1")
 
     network, optimizer, start_iter = load_or_init(cfg, device)
+    if additional_iterations > 0:
+        total_iterations = start_iter + additional_iterations - 1
+        train_cfg["total_iterations"] = total_iterations
+    else:
+        total_iterations = configured_total_iterations
     total_steps = total_iterations * num_self_play_games
     completed_steps = (start_iter - 1) * num_self_play_games
+    completed_iterations = 0
     print(f"[train] run={train_cfg['run_name']} total_iterations={total_iterations}")
     print(f"[train] self-play steps={completed_steps} / {total_steps} steps")
     print(f"[train] checkpoint_dir={ckpt_dir(cfg)}")
@@ -352,7 +367,11 @@ def main(argv: List[str] | None = None):
     if start_iter > total_iterations:
         print(f"[train] Run '{train_cfg['run_name']}' already completed "
               f"through iter={start_iter - 1}.")
+        if progress_cb:
+            progress_cb(0)
         return
+    if progress_cb:
+        progress_cb(0)
 
     for iteration in range(start_iter, total_iterations + 1):
         t0 = time.time()
@@ -375,6 +394,9 @@ def main(argv: List[str] | None = None):
 
         if len(buffer) < train_cfg["batch_size"]:
             print(f"  [iter {iteration}] Buffer too small, skipping training.")
+            completed_iterations += 1
+            if progress_cb:
+                progress_cb(completed_iterations)
             continue
 
         # Training phase
@@ -393,6 +415,10 @@ def main(argv: List[str] | None = None):
 
         if save_every > 0 and (iteration % save_every == 0 or iteration == total_iterations):
             save_checkpoint(cfg, network, optimizer, iteration)
+
+        completed_iterations += 1
+        if progress_cb:
+            progress_cb(completed_iterations)
 
     print(f"[train] Completed {total_iterations} iterations for run "
           f"'{train_cfg['run_name']}'.")

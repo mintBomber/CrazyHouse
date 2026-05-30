@@ -36,6 +36,7 @@ training:
   num_self_play_games: 10 #100      # Self-play games per training iteration
   num_epochs: 3 #10                # Training epochs per iteration
   buffer_size: 20000 #100000           # Replay buffer capacity
+  drop_mode: true                    # true = Crazy House self-play, false = Standard Chess self-play
   save_self_play_records: true      # Save each self-play game as JSON
   self_play_record_dir: "selfplay_records" # Saved under selfplay_records/{run_name}
 

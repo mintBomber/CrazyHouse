@@ -71,7 +71,22 @@ class HandsAndDropsTest(unittest.TestCase):
         self.assertTrue(state.is_in_check(Color.BLACK))
         self.assertEqual(state.current_player, Color.BLACK)
 
-    def test_drop_checkmate_is_illegal_for_any_piece_type(self):
+    def test_pawn_drop_checkmate_is_illegal(self):
+        state = self._empty_state(Color.WHITE)
+        state.hands[Color.WHITE][PieceType.PAWN] = 1
+        state.board[2, 4] = int(PieceType.KING)
+        state.board[7, 4] = 0
+        state.board[0, 3] = -int(PieceType.BISHOP)
+        state.board[0, 5] = -int(PieceType.ROOK)
+        state.board[1, 5] = -int(PieceType.KNIGHT)
+        state.position_history = [state._position_key()]
+
+        move = Move(None, (1, 3), is_drop=True, drop_piece=PieceType.PAWN)
+
+        self.assertFalse(state.is_in_check(Color.WHITE))
+        self.assertNotIn(move, state.get_legal_moves())
+
+    def test_non_pawn_drop_checkmate_is_legal(self):
         state = self._empty_state(Color.WHITE)
         state.hands[Color.WHITE][PieceType.ROOK] = 1
         state.board[2, 4] = int(PieceType.KING)
@@ -85,7 +100,7 @@ class HandsAndDropsTest(unittest.TestCase):
         move = Move(None, (1, 4), is_drop=True, drop_piece=PieceType.ROOK)
 
         self.assertFalse(state.is_in_check(Color.WHITE))
-        self.assertNotIn(move, state.get_legal_moves())
+        self.assertIn(move, state.get_legal_moves())
 
 
 if __name__ == "__main__":
