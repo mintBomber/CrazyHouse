@@ -45,12 +45,9 @@ Thumbs.db
 .vscode/
 .idea/
 
-# others
-refine_plan.md
-training_parameters_guide.md
-training_config_presets.md
-dev_handover.md
-evaluation_fix_report.md
+# Markdown docs (keep only README.md)
+*.md
+!README.md
 
 # AI vs AI results (auto-generated)
 aivai_results/*

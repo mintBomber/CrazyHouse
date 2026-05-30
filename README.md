@@ -1,594 +1,495 @@
-# Chess x Shogi - Gumbel AlphaZero
+# Crazy House
 
-チェスをベースに、将棋の「取った駒を持ち駒として打つ」ルールを加えたハイブリッドボードゲームです。
-GUI は Pygame、AI は Gumbel AlphaZero 形式の MCTS + ResNet で実装しています。
+A chess variant that adds shogi-style piece drops — captured pieces return to the capturer's hand and can be placed back on the board. The AI is powered by a Gumbel AlphaZero implementation (ResNet + Sequential Halving MCTS).
 
-## 目次
+---
 
-1. [セットアップ](#1-セットアップ)
-2. [起動方法](#2-起動方法)
-3. [ゲーム画面と操作](#3-ゲーム画面と操作)
-4. [ルール](#4-ルール)
-5. [棋譜保存と再生](#5-棋譜保存と再生)
-6. [AI 学習](#6-ai-学習)
-7. [設定ファイル](#7-設定ファイル)
-8. [ファイル構成](#8-ファイル構成)
-9. [EXE 化](#9-exe-化)
-10. [テスト](#10-テスト)
+## Quick Start
 
-## 1. セットアップ
+### Run the EXE
 
-必要環境:
+1. Download `CrazyHouse.exe` from [Releases](https://github.com/mintBomber/CrazyHouse/releases) (or build it yourself — see [Building EXE](#9-building-exe))
+2. Double-click `CrazyHouse.exe` — no installation required
+3. A pre-trained model is bundled; you can play against the AI immediately
 
-- Python 3.9 以上
-- CPU でも動作可能
-- GPU を使う場合は CUDA 対応版 PyTorch が必要
+> The window is **resizable** by dragging the corner. Content scales automatically.
 
-インストール:
+### Menu Buttons
 
-```powershell
-cd D:\Programming\PersonalDevelopments\Game02
+| Button | Description |
+|--------|-------------|
+| **Player vs Player** | Two humans on the same machine |
+| **Player vs AI** | Human vs the bundled AI |
+| **AI vs AI** | Watch the AI play itself (batch mode available) |
+| **Replay** | Load and replay a saved game record |
+| **Model Learning** | Run additional self-play training from the UI |
+| **Quit** | Exit the application |
+
+### In-Game Controls
+
+| Action | Input |
+|--------|-------|
+| Select a piece | Left-click your own piece on the board |
+| Move / drop | Left-click a highlighted destination square |
+| Select a hand piece (Crazy House) | Left-click a piece in the right-side hand panel |
+| Deselect | Right-click anywhere |
+| Open pause menu | Press **ESC** (or click the **[ESC] menu** button) |
+
+### Left Panel at a Glance
+
+| Label | Meaning |
+|-------|---------|
+| `Turn: White / Black` | Current player |
+| `Move: N` | Half-move count (each individual move counts as 1) |
+| `Training: N` | Number of self-play iterations the loaded model was trained for |
+| Win gauge | Black% (left) · White% (right) — material-blended NN evaluation |
+| `Best: …` / next candidates | Top policy-head candidate moves |
+| `Main MM:SS  Move N.Ns` | Remaining main time and per-move byoyomi |
+
+---
+
+## Developer Documentation
+
+### Table of Contents
+
+1. [Setup (Python)](#1-setup)
+2. [Running from Source](#2-running-from-source)
+3. [Game Screens & Controls (detail)](#3-game-screens--controls-detail)
+4. [Rules](#4-rules)
+5. [Game Records](#5-game-records)
+6. [AI Training](#6-ai-training)
+7. [Configuration Reference](#7-configuration-reference)
+8. [Architecture & File Structure](#8-architecture--file-structure)
+9. [Building EXE](#9-building-exe)
+10. [Tests](#10-tests)
+
+---
+
+## 1. Setup
+
+**Requirements**
+
+- Python 3.9+
+- CPU-only is supported; CUDA-capable GPU strongly recommended for serious training
+
+**Install**
+
+```bash
 pip install -r requirements.txt
 ```
 
-依存パッケージ:
+| Package | Purpose |
+|---------|---------|
+| `pygame` | GUI |
+| `numpy` | Board representation and move generation |
+| `torch` | Neural network (policy + value heads) |
+| `pyyaml` | `config/config.yaml` loading |
 
-| パッケージ | 用途 |
-| --- | --- |
-| `pygame` | ゲーム UI |
-| `numpy` | 盤面・合法手計算 |
-| `torch` | ニューラルネットワーク |
-| `pyyaml` | `config/config.yaml` の読み込み |
+---
 
-## 2. 起動方法
+## 2. Running from Source
 
-通常起動:
-
-```powershell
+```bash
+# Default — loads checkpoints/{run_name}/latest.pt from config.yaml
 python main.py
-```
 
-学習 run 名を指定して起動:
+# Override run name (loads checkpoints/my_run/latest.pt)
+python main.py --run my_run
 
-```powershell
-python main.py --run run_quick_cpu
-```
+# Load a specific checkpoint file
+python main.py --ckpt checkpoints/run_quick_cpu/iter_00010.pt
 
-この場合、AI は次のモデルを探します。
-
-```text
-checkpoints\run_quick_cpu\latest.pt
-```
-
-チェックポイントファイルを直接指定:
-
-```powershell
-python main.py --ckpt checkpoints\run_quick_cpu\latest.pt
-```
-
-AI 学習のみ実行:
-
-```powershell
+# Run self-play training only (no GUI)
 python -m ai.train
 ```
 
-GUI から追加学習する場合は、トップ画面の `Model Learning` を開きます。
-`Iterations` は現在の `run_name` に対して追加で回すイテレーション数です。
-完了後、次回の AI 対局や評価表示では更新された `latest.pt` を読み込みます。
+---
 
-## 3. ゲーム画面と操作
+## 3. Game Screens & Controls (detail)
 
-### トップ画面
+### Pre-game Setup
 
-トップ画面には以下のボタンがあります。
+| Setting | Details |
+|---------|---------|
+| `Variant` | **Crazy House** (drops enabled) or **Standard Chess** |
+| `First move` | Which color moves first |
+| `Human side` | Which side the human plays (Player vs AI) |
+| `Main time (min)` | Per-player main clock, 0–60 min |
+| `One-move time (sec)` | Per-move byoyomi after main time runs out, 0–600 s |
+| `Matches (AI vs AI)` | Number of consecutive AI vs AI games, 1–1000 |
 
-| ボタン | 内容 |
-| --- | --- |
-| `Player vs Player` | 人間同士で対戦 |
-| `Player vs AI` | 人間と AI が対戦 |
-| `AI vs AI` | AI 同士の自動対戦を観戦。複数対局も指定可能 |
-| `Replay` | 保存済み棋譜を再生 |
-| `Model Learning` | GUI から追加学習を実行 |
-| `Quit` | アプリを終了 |
+Click a number field to type a value directly; `+` / `−` buttons adjust by 1.
 
-### 対局前設定
+### In-Game Panel
 
-対局モードを選ぶと、開始前に以下を設定できます。
+**Left sidebar**
 
-| 項目 | 内容 |
-| --- | --- |
-| `Variant` | Crazy House / Standard のルール選択 |
-| `First move` | 白番・黒番のどちらを先手にするか |
-| `Human side` | Player vs AI で人間が先手か後手か |
-| `Player 1` | Player vs Player で Player 1 が先手か後手か |
-| `Main time (min)` | 各プレイヤーの持ち時間。範囲は `0-60` 分 |
-| `One-move time (sec)` | 持ち時間を使い切った後の 1 手秒読み。範囲は `0-600` 秒 |
-| `Matches (AI vs AI)` | AI vs AI の連続対局数。範囲は `1-1000` |
-
-`Main time` と `One-move time` は、`+` / `-` ボタンでも、数字欄の直接入力でも変更できます。
-`One-move time` は 1 秒単位で変化します。
-
-AI vs AI で `Matches (AI vs AI)` を `2` 以上にすると、指定回数だけ連続対局します。
-完了後に勝敗数・平均手数のリザルト画面が表示され、結果 JSON は次に保存されます。
-
-```text
-aivai_results\
+```
+Turn: White
+AI thinking…          ← shown while AI is computing
+Move: 28
+50-move: 0/100
+Training: 20
+49%         51%       ← Black / White win probability
+[====|=====]          ← evaluation gauge
+Best: Nf3
+d4, c4, e5            ← next 3 candidate moves
+White (First)
+  Main 03:50  Move 10.0s
+Black (Second)
+  Main 04:49  Move 10.0s
+[Resign]
+[Save Record]
+AI vs AI
+[ESC] menu
 ```
 
-### 対局中の操作
+**Right sidebar (Crazy House only)**
 
-| 操作 | 内容 |
-| --- | --- |
-| 盤上の自分の駒を左クリック | 駒を選択 |
-| 青い候補マスを左クリック | 選択中の駒を移動 |
-| 右サイドバーの自分の持ち駒を左クリック | 打つ持ち駒を選択 |
-| 青い候補マスを左クリック | 選択中の持ち駒を盤上に打つ |
-| 右クリック | 選択解除 |
-| `ESC` | トップ画面へ戻る |
+- `Black's hand` — captured pieces available for Black to drop
+- `White's hand` — same for White
+- The active side's panel is highlighted with an orange border
+- Greyed-out pieces have a count of ×0
 
-右サイドバーには `Black's hand` と `White's hand` が表示されます。
-現在手番側の持ち駒欄は枠で強調されます。
-持ち駒を打つと、その駒は自分の色の駒として盤上に置かれます。
+### End-of-Game Screen
 
-### 左サイドバー
+Outcomes: `Check Mate`, `Stale Mate`, `Draw`, `Time Up`, `Resign`
 
-左サイドバーには以下が表示されます。
+| Button | Action |
+|--------|--------|
+| `Replay` | Rematch with the same settings |
+| `Top` | Return to the main menu |
+| `Save Record` | Save the game as a JSON file |
 
-- 現在の手番
-- 手数
-- 50 手ルールカウンタ
-- 読み込んだ AI モデルの学習イテレーション数
-- `Front win`、手前側の白番視点の勝率
-- 白黒それぞれの残り持ち時間と 1 手秒読み
-- `CHECK!` 表示
-- `Resign` ボタン
-- `Save Record` ボタン
+### Replay Screen
 
-`Resign` を押すと `Really Quit？` ダイアログが表示されます。
-`Yes` を押すと現在手番が投了し、相手勝ちとして決着画面に移ります。
-`No` または `ESC` で対局に戻ります。
+| Button | Action |
+|--------|--------|
+| `<<` | Jump to move 0 |
+| `<` | Step back one move |
+| `Go` | Start auto-play (1 move per second) |
+| `\|\|` | Stop auto-play |
+| `>` | Step forward one move |
+| `>>` | Jump to the last move |
+| **[ESC] Top** | Return to the main menu (also clickable) |
 
-### 決着画面
+The replay panel shows the same evaluation gauge and candidate moves that were recorded at each position during the original game. For records without stored evaluations the gauge is computed live from material count.
 
-決着時は盤面中央に白いボックスが表示され、以下のように結果が表示されます。
+### AI vs AI Batch Mode
 
-- `Check Mate`
-- `Stale Mate`
-- `Draw`
-- `Time Up`
-- `Resign`
+Setting `Matches` > 1 runs that many games automatically. On completion a result screen shows:
 
-ボックス内には次のボタンがあります。
+- Total matches, First-player wins, Second-player wins, Draws
+- Average turn count
+- Rule variant
 
-| ボタン | 内容 |
-| --- | --- |
-| `Replay` | 同じ条件で再対局 |
-| `Top` | トップ画面へ戻る |
-| `Save Record` | 保存名とメモを入力して棋譜保存 |
+Results are saved as JSON under `aivai_results/`.
 
-## 4. ルール
+### Model Learning (GUI)
 
-### 基本ルール
+**Model Learning** in the main menu opens a training dialog:
 
-基本的な駒の動きはチェスと同じです。
-
-| ルール | 内容 |
-| --- | --- |
-| 勝利条件 | 相手のキングをチェックメイトする |
-| キャスリング | 有効 |
-| アンパッサン | 有効 |
-| ポーンの成り | 最終段で Queen / Rook / Bishop / Knight に成れる |
-| ステイルメイト | 引き分け |
-| 50 手ルール | 捕獲もポーン前進もない半手 100 回で引き分け |
-| 三回同一局面 | 引き分け |
-
-キングは捕獲されません。
-キングを取る手は合法手として生成されず、勝敗はチェックメイトで決まります。
-
-### 持ち駒ルール
-
-相手の駒を取ると、その駒は自分の持ち駒になります。
-自分の手番で、持ち駒を空きマスに打てます。
-
-打ち駒の制約:
-
-| 制約 | 内容 |
-| --- | --- |
-| 空きマスのみ | 既に駒があるマスには打てない |
-| ポーン最終段打ち禁止 | 白ポーンは 8 段目、黒ポーンは 1 段目に打てない |
-| ポーン打ち即詰み禁止 | ポーンを打ったその手で相手を即チェックメイトにする手は不合法 |
-
-持ち駒打ちでチェックを掛けること自体は合法です。
-ただし、ポーン打ちが即詰みになる場合だけは不合法です。
-ポーン以外の持ち駒打ちで即詰みになる手は合法です。
-
-### チェック表示
-
-手を指した直後、相手のキングにチェックが掛かった場合は UI に `CHECK!` が表示されます。
-保存棋譜にも各手ごとに `check: true/false` が記録されます。
-
-## 5. 棋譜保存と再生
-
-### 棋譜保存
-
-対局中、または決着画面の `Save Record` を押すと、保存ダイアログが開きます。
-
-入力できる項目:
-
-- `Save name`
-- `Memo`
-
-下部には `Save` と `Cancel` があります。
-保存中は `Saving...`、完了後は `Save Completed！` が表示され、ダイアログは自動で閉じます。
-
-保存先:
-
-```text
-gamerecord\
-```
-
-保存ファイル名の例:
-
-```text
-gamerecord\20260529_153012_my_game.json
-```
-
-棋譜 JSON には主に以下が入ります。
-
-- 対局モード
-- 保存名
-- メモ
-- 開始時刻・保存時刻
-- 先手色
-- 持ち時間設定
-- 結果
-- 終了理由、通常 / 時間切れ / 投了
-- 各手の移動元・移動先
-- 成り情報
-- 持ち駒打ち情報
-- チェック判定
-- 最終盤面
-
-### 棋譜再生
-
-トップ画面の `Replay` から、`gamerecord\` 内の棋譜を一覧表示できます。
-
-一覧画面でできること:
-
-| 操作 | 内容 |
-| --- | --- |
-| 棋譜行をクリック | その棋譜を再生 |
-| 左のチェックボックス | 棋譜を選択 |
-| `Delete` | その 1 件を削除 |
-| `Delete Selected` | 選択中の棋譜を削除 |
-| `Delete All` | 棋譜を一括削除 |
-| `Back` | トップ画面へ戻る |
-
-削除前には確認ダイアログが表示されます。
-
-再生画面のボタン:
-
-| ボタン | 内容 |
-| --- | --- |
-| `<<` | 0 手目に戻る |
-| `<` | 1 手戻す |
-| `▶` | 1 秒に 1 手で自動再生 |
-| `□` | 自動再生停止 |
-| `>` | 1 手進める |
-| `>>` | 最終局面へ進める |
-
-## 6. AI 学習
-
-### GUI から追加学習
-
-トップ画面の `Model Learning` では、以下を指定して追加学習できます。
-
-| 項目 | 内容 |
-| --- | --- |
-| `Iterations` | 追加で回す学習イテレーション数。範囲は `1-9999` |
+| Setting | Range |
+|---------|-------|
+| `Iterations` | 1–9999 additional training iterations |
 | `Rule` | Crazy House / Standard |
 
-`Execute` を押すとバックグラウンドで学習が始まり、進行画面には `Now: 3 / 20 steps` の形式で進捗が表示されます。
-ここでの `steps` は追加イテレーション数です。
+Progress is shown as `Now: N / M steps`. On completion the AI agent is reloaded automatically.
 
-### 学習の流れ
+---
 
-`python -m ai.train` は自己対戦学習を実行します。
+## 4. Rules
 
-流れ:
+### Standard Chess Rules (all apply)
 
-1. 現在のネットワークで自己対戦する
-2. 各局面の `(状態, MCTS 後の方策, 勝敗)` を replay buffer に入れる
-3. replay buffer からミニバッチをサンプルして学習する
-4. 一定イテレーションごとにチェックポイントを保存する
+| Rule | Status |
+|------|--------|
+| Castling | ✓ |
+| En passant | ✓ |
+| Pawn promotion | ✓ (Queen / Rook / Bishop / Knight) |
+| Stalemate → draw | ✓ |
+| 50-move rule (100 half-moves) | ✓ |
+| Threefold repetition | ✓ |
+| King capture | ✗ — game ends by checkmate only |
 
-学習進捗は 10 局ごとに次の形式で表示されます。
+### Crazy House Additions
 
-```text
-10 / 200 steps
-20 / 200 steps
+| Rule | Detail |
+|------|--------|
+| Captured pieces go to hand | Captured piece is demoted to its base type (no promoted pieces in hand) |
+| Drop on empty square | Any hand piece can be placed on any empty square |
+| No pawn drop on back rank | White pawns cannot be dropped on rank 8; Black pawns on rank 1 |
+| No pawn-drop checkmate | Dropping a pawn that immediately checkmates is illegal (打ち歩詰め) |
+| Non-pawn drop checkmate | Dropping any other piece that gives checkmate **is** legal |
+
+---
+
+## 5. Game Records
+
+### Format
+
+Records are saved as JSON under `gamerecord/`.  
+File name pattern: `YYYYMMDD_HHMMSS_<save_name>.json`
+
+Key fields in the record:
+
+```json
+{
+  "game": "Chess x Shogi",
+  "variant": "crazy_house",
+  "move_count": 72,
+  "result": "white_win",
+  "moves": [
+    {
+      "move_number": 1,
+      "player": "white",
+      "notation": "e2e4",
+      "check": false,
+      "eval_winrate": 51.2,
+      "eval_best": "e2e4",
+      "eval_candidates": ["d2d4", "g1f3"]
+    }
+  ]
+}
 ```
 
-ここでの `steps` は自己対戦局数です。
+`eval_winrate`, `eval_best`, and `eval_candidates` are recorded for each move at the moment it is played (evaluation of the position *before* the move). These are replayed in the Replay screen without recomputation.
 
-```text
-total_iterations * num_self_play_games = 自己対戦の総局数
+### Replay List
+
+The Replay screen lists all files in `gamerecord/` sorted by modification time.
+
+| Control | Action |
+|---------|--------|
+| Click a row | Open that record |
+| Checkbox | Select for batch delete |
+| `Delete` | Delete one record (with confirmation) |
+| `Delete Selected` | Delete selected records |
+| `Delete All` | Delete all records |
+
+---
+
+## 6. AI Training
+
+### Algorithm
+
+Gumbel AlphaZero ([Danihelka et al., 2022](https://arxiv.org/abs/2205.11093)):
+
+1. Self-play using Gumbel MCTS (Sequential Halving with Gumbel noise at root)
+2. Collect `(state, improved_policy, outcome)` tuples into a replay buffer
+3. Train the network on mini-batches (policy cross-entropy + value MSE)
+4. Checkpoint periodically
+
+### Checkpoints
+
+```
+checkpoints/{run_name}/
+├── iter_00010.pt
+├── iter_00020.pt
+└── latest.pt          ← always the most recent
 ```
 
-### モデル保存先
+### Current (lightweight) Config
 
-チェックポイントは次に保存されます。
-
-```text
-checkpoints\{run_name}\
-```
-
-例:
-
-```text
-checkpoints\run_quick_cpu\iter_00010.pt
-checkpoints\run_quick_cpu\latest.pt
-```
-
-`latest.pt` は常に最新モデルです。
-GUI で `--run run_quick_cpu` を指定した場合、この `latest.pt` を読みます。
-
-### 自己対戦棋譜の保存
-
-現在のコードでは、学習用の自己対戦棋譜も JSON で保存できます。
-設定は `config/config.yaml` の `training` にあります。
-
-```yaml
-save_self_play_records: true
-self_play_record_dir: "selfplay_records"
-```
-
-保存先:
-
-```text
-selfplay_records\{run_name}\
-```
-
-例:
-
-```text
-selfplay_records\run_quick_cpu\iter_00001_game_00001_step_000001.json
-```
-
-注意:
-
-- 学習用サンプル自体はメモリ上の replay buffer に入ります。
-- 自己対戦棋譜 JSON は分析・確認用の保存です。
-- 既に起動済みの学習プロセスにはコード変更は反映されません。再起動後から有効です。
-
-### 現在の軽量設定
-
-現在の `config/config.yaml` は CPU で回しやすい軽量設定です。
-
-主な値:
+The bundled `config.yaml` is tuned for CPU use:
 
 ```yaml
 ai:
   device: "cpu"
   mcts_simulations: 25
-  gumbel_K: 8
-
 network:
   num_res_blocks: 3
   channels: 64
-  value_fc_size: 128
-
 training:
   run_name: "run_quick_cpu"
   total_iterations: 20
-  num_self_play_games: 10
-  batch_size: 128
-  num_epochs: 3
+  num_self_play_games: 10   # → 200 total games
 ```
 
-この設定では自己対戦総局数は次の通りです。
-
-```text
-20 * 10 = 200 局
-```
-
-### 10000 局学習の例
-
-10000 局にしたい場合は、例えば次のようにします。
-
-```yaml
-training:
-  run_name: "run_10000_games"
-  total_iterations: 100
-  num_self_play_games: 100
-  save_every_n_iters: 10
-  keep_last_n_checkpoints: 10
-```
-
-自己対戦総局数:
-
-```text
-100 * 100 = 10000 局
-```
-
-探索量を増やす場合:
+### Recommended Config for Stronger Play
 
 ```yaml
 ai:
-  mcts_simulations: 100
+  device: "cuda"
+  mcts_simulations: 400
+network:
+  num_res_blocks: 10
+  channels: 256
+  value_fc_size: 256
+training:
+  run_name: "run_strong"
+  total_iterations: 1000
+  num_self_play_games: 100  # → 100,000 total games
+  batch_size: 256
+  buffer_size: 100000
 ```
 
-強くなりやすい一方、学習時間はかなり増えます。
-対局時だけ読みを深くしたい場合は、学習後に `mcts_simulations` を上げて GUI を起動します。
+### Evaluation
 
-## 7. 設定ファイル
+The win-probability gauge blends the NN value head with a material-count heuristic:
 
-設定ファイル:
-
-```text
-config\config.yaml
 ```
+nn_weight   = clamp(|nn_value| / 0.15,  0, 1)
+win%        = nn_weight × nn_win% + (1 − nn_weight) × material_win%
+```
+
+An undertrained network outputs values near 0, so the material heuristic dominates until the network converges. Piece values: P=1, N=3, B=3, R=5, Q=9.
+
+---
+
+## 7. Configuration Reference
+
+`config/config.yaml`
 
 ### `game`
 
-| 項目 | 内容 |
-| --- | --- |
-| `max_moves` | 1 局の最大半手数 |
-| `board_size` | 盤面サイズ。通常は `8` 固定 |
+| Key | Description |
+|-----|-------------|
+| `max_moves` | Max half-moves before draw |
+| `board_size` | Always 8 |
 
 ### `ai`
 
-| 項目 | 内容 |
-| --- | --- |
-| `device` | `cpu` または `cuda` |
-| `mcts_simulations` | 1 手あたりの MCTS シミュレーション数 |
-| `gumbel_K` | Gumbel Sequential Halving の初期候補手数 |
-| `c_puct` | PUCT の探索係数 |
-| `dirichlet_alpha` | 自己対戦時のルートノイズ強度 |
-| `dirichlet_eps` | ノイズ混合率 |
-| `temperature` | 指し手サンプリング温度 |
-| `temperature_threshold` | この手数以降は greedy に寄せる |
-| `value_scale` | value head のスケール |
+| Key | Description |
+|-----|-------------|
+| `device` | `cpu` or `cuda` |
+| `mcts_simulations` | Simulations per move |
+| `gumbel_K` | Initial candidates for Gumbel Sequential Halving |
+| `c_puct` | PUCT exploration constant (non-root nodes) |
+| `dirichlet_alpha` | Root noise alpha (self-play only) |
+| `dirichlet_eps` | Root noise mix ratio |
+| `temperature` | Move sampling temperature |
+| `temperature_threshold` | Move number after which temperature → 0 |
 
 ### `network`
 
-| 項目 | 内容 |
-| --- | --- |
-| `num_res_blocks` | ResBlock 数 |
-| `channels` | 中間チャンネル数 |
-| `policy_channels` | policy head の中間チャンネル数 |
-| `value_channels` | value head の中間チャンネル数 |
-| `value_fc_size` | value head の全結合層サイズ |
-| `input_planes` | 入力チャンネル数。現在は `28` |
+| Key | Description |
+|-----|-------------|
+| `num_res_blocks` | Number of residual blocks |
+| `channels` | Feature channels |
+| `policy_channels` | Policy head intermediate channels |
+| `value_channels` | Value head intermediate channels |
+| `value_fc_size` | Value head FC hidden size |
+| `input_planes` | Input feature planes (28 fixed) |
 
 ### `training`
 
-| 項目 | 内容 |
-| --- | --- |
-| `run_name` | 学習 run 名 |
-| `total_iterations` | 学習イテレーション数 |
-| `checkpoint_dir` | モデル保存先ルート |
-| `save_every_n_iters` | 何イテレーションごとに保存するか |
-| `keep_last_n_checkpoints` | 直近何個の `iter_XXXXX.pt` を残すか。`0` で全保持 |
-| `resume` | `latest.pt` から再開するか |
-| `batch_size` | 学習バッチサイズ |
-| `lr` | 学習率 |
-| `weight_decay` | L2 正則化 |
-| `num_self_play_games` | 1 イテレーションあたりの自己対戦局数 |
-| `num_epochs` | 1 イテレーションあたりの学習 epoch 数 |
-| `buffer_size` | replay buffer の最大サンプル数 |
-| `drop_mode` | 自己対戦学習で Crazy House の持ち駒ルールを使うか |
-| `save_self_play_records` | 自己対戦棋譜 JSON を保存するか |
-| `self_play_record_dir` | 自己対戦棋譜の保存先ルート |
+| Key | Description |
+|-----|-------------|
+| `run_name` | Subdirectory name under `checkpoints/` |
+| `total_iterations` | Total training iterations for this run |
+| `checkpoint_dir` | Root checkpoint directory |
+| `save_every_n_iters` | Checkpoint save frequency |
+| `keep_last_n_checkpoints` | How many `iter_*.pt` files to keep (0 = all) |
+| `resume` | Resume from `latest.pt` if present |
+| `batch_size` | Training batch size |
+| `lr` | Learning rate |
+| `weight_decay` | L2 regularization |
+| `num_self_play_games` | Self-play games per iteration |
+| `num_epochs` | Training epochs per iteration |
+| `buffer_size` | Replay buffer capacity |
+| `drop_mode` | Enable Crazy House rules during self-play |
+| `save_self_play_records` | Save self-play game JSONs |
+| `self_play_record_dir` | Directory for self-play records |
 
 ### `ui`
 
-| 項目 | 内容 |
-| --- | --- |
-| `window_width`, `window_height` | ウィンドウサイズ |
-| `board_offset_x`, `board_offset_y` | 盤面画像の表示位置 |
-| `board_display_width` | 盤面画像の表示幅 |
-| `board_col_starts`, `board_row_starts` | 盤面画像内の 8x8 グリッド境界 |
-| `board_frame_right`, `board_frame_bottom` | 盤面枠の右端・下端 |
-| `board_sq_size` | 駒画像サイズ |
-| `fps` | フレームレート |
-| `animation_speed` | AI vs AI の表示待機時間 |
-| `hand_panel_x` | 右サイドバーの X 座標 |
-| `hand_piece_size` | 持ち駒アイコンサイズ |
-| `font_size` | 基本フォントサイズ |
-| `highlight_alpha` | ハイライト透明度 |
-| `colors` | UI 色設定 |
+| Key | Description |
+|-----|-------------|
+| `window_width`, `window_height` | Initial OS window size (logical canvas is fixed 1200×750) |
+| `board_offset_x/y` | Board image top-left in logical canvas |
+| `board_display_width` | Rendered board width |
+| `board_col_starts`, `board_row_starts` | Grid pixel boundaries (auto-derived) |
+| `fps` | Frame rate |
+| `hand_panel_x` | Right panel X coordinate |
+| `font_size` | Base font size |
+| `colors` | UI colour overrides |
 
-## 8. ファイル構成
+---
 
-```text
-Game02/
-├── main.py
+## 8. Architecture & File Structure
+
+```
+CrazyHouse/
+├── main.py                  # CLI entry point
 ├── requirements.txt
-├── CrazyHouse.spec
-├── chess_board.png
-├── chess_pieces.png
+├── CrazyHouse.spec          # PyInstaller spec
+├── chess_board.png          # Board image (1602×1202)
+├── chess_pieces.png         # Sprite sheet (2 rows × 6 cols)
 ├── config/
 │   └── config.yaml
 ├── game/
-│   ├── pieces.py
-│   └── board.py
+│   ├── pieces.py            # PieceType, Color, Move, action-index mapping
+│   └── board.py             # GameState: move gen, check, drop rules, terminal
 ├── ai/
-│   ├── network.py
-│   ├── mcts.py
-│   ├── agent.py
-│   └── train.py
+│   ├── network.py           # ResNet: 28-plane input → policy (4416) + value
+│   ├── mcts.py              # Gumbel MCTS with Sequential Halving
+│   ├── agent.py             # AIAgent: wraps network + MCTS for the GUI
+│   └── train.py             # Self-play training loop
 ├── ui/
-│   ├── assets.py
-│   └── ui.py
+│   ├── assets.py            # Image loading with alpha-channel sprite detection
+│   └── ui.py                # Pygame UI (game loop, dialogs, replay, training UI)
 ├── tests/
 │   └── test_hands_and_drops.py
 ├── checkpoints/
-│   └── .gitkeep
-├── gamerecord/
-│   └── .gitkeep
-├── selfplay_records/
-│   └── .gitkeep
-└── aivai_results/
-    └── .gitkeep
+│   └── run_quick_cpu/
+│       └── latest.pt        # Bundled pre-trained model
+├── gamerecord/              # User game records (gitignored)
+├── selfplay_records/        # Self-play training records (gitignored)
+└── aivai_results/           # AI vs AI batch results (gitignored)
 ```
 
-主な役割:
+### Action Space
 
-| パス | 内容 |
-| --- | --- |
-| `game/pieces.py` | 駒種、色、Move、アクション ID 変換 |
-| `game/board.py` | 盤面、合法手、持ち駒、詰み、引き分け判定 |
-| `ai/network.py` | ResNet policy/value network |
-| `ai/mcts.py` | Gumbel AlphaZero MCTS |
-| `ai/agent.py` | GUI から使う AI エージェント |
-| `ai/train.py` | 自己対戦学習 |
-| `ui/assets.py` | 画像読み込み |
-| `ui/ui.py` | Pygame UI、棋譜保存、再生、投了、時間管理 |
-| `CrazyHouse.spec` | PyInstaller 用ビルド設定 |
-
-### Git 管理対象外のデータ
-
-`.gitignore` で以下はアップロードされない設定です。
-
-```text
-checkpoints/*
-gamerecord/*
-selfplay_records/*
-aivai_results/*
-*.pt
-*.pth
-*.ckpt
-*.onnx
+```
+4416 total actions
+├── 4096 board moves  (64 from-squares × 64 to-squares)
+└──  320 drop moves   (5 piece types × 64 squares)
 ```
 
-各フォルダの `.gitkeep` だけを管理対象にしています。
+### Input Planes (28 channels, 8×8)
 
-## 9. EXE 化
+| Channels | Content |
+|----------|---------|
+| 0–5 | Current player's pieces (P R N B Q K) |
+| 6–11 | Opponent's pieces |
+| 12–16 | Current player's hand counts |
+| 17–21 | Opponent's hand counts |
+| 22–25 | Castling rights |
+| 26 | En-passant target square |
+| 27 | Side-to-move flag |
 
-PyInstaller を使う場合は、次のようにビルドします。
+---
 
-```powershell
+## 9. Building EXE
+
+```bash
 pip install pyinstaller
 pyinstaller CrazyHouse.spec --clean
+# Output: dist/CrazyHouse/CrazyHouse.exe
 ```
 
-生成物は `dist\CrazyHouse\` に出力されます。
-PyTorch を含むため、EXE は大きくなります。
+Notes:
 
-## 10. テスト
+- PyTorch makes the bundle large (~300 MB+); use `--onedir` (default) for faster startup
+- For distribution, use the CPU-only PyTorch wheel to reduce size:
+  ```bash
+  pip install torch --index-url https://download.pytorch.org/whl/cpu
+  ```
+- Set `console=False` in the spec for release builds; `True` for debugging
 
-持ち駒と打ち駒に関する回帰テストがあります。
+---
 
-```powershell
+## 10. Tests
+
+```bash
 python -m unittest discover -s tests
 ```
 
-現在確認している内容:
+Current test coverage (`tests/test_hands_and_drops.py`):
 
-- 捕獲した駒が捕獲者の持ち駒に入る
-- 白の持ち駒打ちは白い駒として置かれる
-- 黒の持ち駒打ちは黒い駒として置かれる
-- チェックになる持ち駒打ちは合法
-- 即詰みになるポーン打ちは不合法
-- ポーン以外の即詰み打ちは合法
+- Captured piece enters the capturer's hand
+- White/Black hand pieces are placed as the correct color
+- Check-giving drops are legal
+- Pawn-drop checkmate is illegal (打ち歩詰め)
+- Non-pawn drop checkmate is legal
