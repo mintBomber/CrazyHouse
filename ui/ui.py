@@ -2153,6 +2153,12 @@ class ChessUI:
                 self._show_menu()
                 return
             if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
+                top_rect = pygame.Rect(8, self.H - 62, max(80, self.BX - 18), 38)
+                if top_rect.collidepoint(self._to_logical(ev.pos)):
+                    self._replay_auto = False
+                    self._is_replay = False
+                    self._show_menu()
+                    return
                 for rect, _label, action in self._replay_buttons():
                     if not rect.collidepoint(self._to_logical(ev.pos)):
                         continue
@@ -2652,8 +2658,8 @@ class ChessUI:
                 alts_s = self.font_xs.render(alts, True, _C["text2"])
                 self.screen.blit(alts_s, (bar_x, y))
 
-        esc_s = self.font_sm.render("[ESC] Top", True, _C["text2"])
-        self.screen.blit(esc_s, (10, self.H - 56))
+        top_rect = pygame.Rect(8, self.H - 62, max(80, self.BX - 18), 38)
+        self._draw_rect_button(top_rect, "[ESC] Top", mx, my, font=self.font_sm)
 
     # -----------------------------------------------------------------
     # Game-over screen
