@@ -1061,6 +1061,10 @@ class ChessUI:
                     if self._save_btn_rect.collidepoint(self._to_logical(ev.pos)):
                         self._show_save_record_dialog()
                         continue
+                    _esc_rect = pygame.Rect(8, self.H - 62, max(80, self.BX - 18), 38)
+                    if _esc_rect.collidepoint(self._to_logical(ev.pos)):
+                        self._show_escape_dialog()
+                        continue
                     self._on_click(self._to_logical(ev.pos))
                 elif ev.button == 3:
                     self._deselect()
@@ -2576,8 +2580,8 @@ class ChessUI:
                                      True, _C["text2"])
         self.screen.blit(mode_s, (10, y)); y += 24
 
-        esc_s = self.font_sm.render("[ESC] menu", True, _C["text2"])
-        self.screen.blit(esc_s, (10, y))
+        esc_rect = pygame.Rect(8, self.H - 62, max(80, self.BX - 18), 38)
+        self._draw_rect_button(esc_rect, "[ESC] menu", mx, my, font=self.font_sm)
 
         # Status message
         if self.status_msg:
