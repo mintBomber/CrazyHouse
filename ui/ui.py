@@ -1168,7 +1168,19 @@ class ChessUI:
     def _execute_move(self, move: Move) -> None:
         player = self.state.current_player
         self._commit_elapsed_time(player)
+        # Capture evaluation of the CURRENT position before the move is applied.
+        # This is stored in the record so replay can show it without recomputing.
+        snap_wr    = self._front_winrate
+        snap_cands = self._ai_candidates
         self.game_record.append(self._record_move(move, player, self.move_number + 1))
+        # Attach evaluation snapshot to the record entry.
+        self.game_record[-1]["eval_winrate"] = (
+            round(snap_wr, 1) if snap_wr is not None else None
+        )
+        if snap_cands is not None:
+            best, others = snap_cands
+            self.game_record[-1]["eval_best"]       = best
+            self.game_record[-1]["eval_candidates"] = list(others[:3])
         self.state.apply_move(move)
         gives_check = self.state.is_in_check(self.state.current_player)
         self.game_record[-1]["check"] = gives_check
@@ -2077,8 +2089,24 @@ class ChessUI:
         self.selected_square = None
         self.selected_hand = None
         self.highlight_squares = []
-        self._front_winrate = None
-        self._ai_candidates = None
+
+        # Load stored evaluation for this position if available.
+        # game_record[N]["eval_*"] stores the evaluation of position at index N
+        # (captured just before move N+1 was applied).
+        if self._replay_index < len(self._replay_moves):
+            rec = self._replay_moves[self._replay_index]
+            stored_wr   = rec.get("eval_winrate")
+            stored_best = rec.get("eval_best")
+            stored_cands = rec.get("eval_candidates", [])
+            if stored_wr is not None:
+                self._front_winrate  = float(stored_wr)
+                self._ai_candidates  = (stored_best, stored_cands) if stored_best else None
+                self._value_eval_dirty = False
+                return
+
+        # No stored data — fall back to live evaluation.
+        self._front_winrate  = None
+        self._ai_candidates  = None
         self._value_eval_dirty = True
 
     def _replay_buttons(self) -> List[tuple[pygame.Rect, str, str]]:
@@ -2087,12 +2115,12 @@ class ChessUI:
         w = 25
         h = 34
         gap = 3
-        play_label = "□" if self._replay_auto else "▶"
+        play_label = "||" if self._replay_auto else "Go"
         items = [
             ("<<", "start"),
-            ("<", "prev"),
+            ("<",  "prev"),
             (play_label, "play"),
-            (">", "next"),
+            (">",  "next"),
             (">>", "end"),
         ]
         return [
@@ -2573,8 +2601,56 @@ class ChessUI:
 
         mx, my = self._to_logical(pygame.mouse.get_pos())
         for rect, label, action in self._replay_buttons():
-            text_color = (220, 30, 30) if action == "play" and label == "▶" else None
+            text_color = (220, 30, 30) if action == "play" and label == "Go" else None
             self._draw_rect_button(rect, label, mx, my, font=self.font_sm, text_color=text_color)
+
+        # Evaluation section (below buttons at y ≈ 260)
+        y = 260
+        winrate = self._get_front_winrate()
+        bar_x = 10
+        bar_w = max(60, self.BX - 30)
+
+        # Win% labels
+        if winrate is not None:
+            b_lbl = self.font_xs.render(f"{100 - winrate:.0f}%", True, _C["text2"])
+            w_lbl = self.font_xs.render(f"{winrate:.0f}%",       True, _C["text2"])
+        else:
+            b_lbl = self.font_xs.render("--", True, _C["text2"])
+            w_lbl = self.font_xs.render("--", True, _C["text2"])
+        self.screen.blit(b_lbl, (bar_x, y))
+        self.screen.blit(w_lbl, (bar_x + bar_w - w_lbl.get_width(), y))
+        y += b_lbl.get_height() + 2
+
+        # Gauge bar
+        bar_h = 12
+        pygame.draw.rect(self.screen, (20, 20, 20), (bar_x, y, bar_w, bar_h), border_radius=3)
+        if winrate is not None:
+            white_w = max(0, int(bar_w * winrate / 100.0))
+            black_w = bar_w - white_w
+            if black_w > 0:
+                pygame.draw.rect(self.screen, (40, 40, 40),
+                                 (bar_x, y, black_w, bar_h), border_radius=3)
+            if white_w > 0:
+                pygame.draw.rect(self.screen, (215, 215, 215),
+                                 (bar_x + black_w, y, white_w, bar_h), border_radius=3)
+        pygame.draw.rect(self.screen, _C["text2"], (bar_x, y, bar_w, bar_h),
+                         width=1, border_radius=3)
+        y += bar_h + 6
+
+        # Candidate moves
+        candidates = self._get_ai_candidates()
+        if candidates is not None:
+            best, others = candidates
+            best_s = self.font_xs.render(f"Best: {best}", True, _C["text"])
+            self.screen.blit(best_s, (bar_x, y))
+            y += 18
+            if others:
+                alts = ", ".join(str(o) for o in others[:3])
+                max_w = self.BX - 22
+                while alts and self.font_xs.size(alts)[0] > max_w:
+                    alts = alts.rsplit(",", 1)[0]
+                alts_s = self.font_xs.render(alts, True, _C["text2"])
+                self.screen.blit(alts_s, (bar_x, y))
 
         esc_s = self.font_sm.render("[ESC] Top", True, _C["text2"])
         self.screen.blit(esc_s, (10, self.H - 56))
